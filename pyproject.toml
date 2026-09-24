@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clinical-data-gen"
+version = "0.1.0"
+description = "Reproducible synthetic streaming data for deterioration-copilot evaluation"
+requires-python = ">=3.10"
+
+[project.scripts]
+clinical-data-gen = "clinical_data_gen.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
