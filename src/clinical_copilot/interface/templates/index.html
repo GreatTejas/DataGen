@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Clinical Deterioration & Escalation Copilot | Team 38</title>
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <!-- Chart.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <!-- CSS -->
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="dark-theme">
+  <header class="app-header">
+    <div class="header-left">
+      <div class="logo-group">
+        <div class="pulse-indicator"></div>
+        <h1>Clinical Deterioration Copilot</h1>
+      </div>
+      <span class="badge team-badge">Team 38 • Healthcare AI</span>
+    </div>
+
+    <div class="header-center simulation-controls">
+      <div class="sim-status">
+        <span class="sim-label">Simulation:</span>
+        <span id="sim-progress" class="mono">0 / 10,800 events</span>
+      </div>
+      <div class="btn-group">
+        <button id="btn-step" class="btn btn-secondary" title="Process next 60 events">⏩ Step +60s</button>
+        <button id="btn-step-cohort" class="btn btn-primary" title="Process 1 hour across all patients">⚡ Advance 1h</button>
+        <button id="btn-play-pause" class="btn btn-secondary">▶️ Stream</button>
+        <button id="btn-reset" class="btn btn-outline" title="Reset simulation">↺ Reset</button>
+      </div>
+    </div>
+
+    <div class="header-right">
+      <button id="btn-open-metrics" class="btn btn-outline">📊 Benchmark Metrics</button>
+      <button id="btn-open-audit" class="btn btn-outline">
+        <span class="integrity-dot valid"></span>
+        Audit Trail
+      </button>
+    </div>
+  </header>
+
+  <!-- KPI Ribbon -->
+  <section class="kpi-ribbon">
+    <div class="kpi-card">
+      <div class="kpi-label">Active Monitored Patients</div>
+      <div class="kpi-value mono" id="kpi-total-patients">60</div>
+    </div>
+    <div class="kpi-card alert-kpi">
+      <div class="kpi-label">Active Deterioration Alerts</div>
+      <div class="kpi-value mono" id="kpi-active-alerts">0</div>
+    </div>
+    <div class="kpi-card defer-kpi">
+      <div class="kpi-label">Deferred / Under Review</div>
+      <div class="kpi-value mono" id="kpi-deferred">0</div>
+    </div>
+    <div class="kpi-card artifact-kpi">
+      <div class="kpi-label">Artifacts Suppressed</div>
+      <div class="kpi-value mono" id="kpi-suppressed">0</div>
+    </div>
+    <div class="kpi-card audit-kpi">
+      <div class="kpi-label">Audit Ledger Status</div>
+      <div class="kpi-status-tag">
+        <span class="status-indicator-green"></span>
+        <span id="audit-status-text">SHA-256 Intact</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- Main Grid Layout -->
+  <main class="main-layout">
+    <!-- Left Column: Patient Triage Board -->
+    <aside class="triage-sidebar">
+      <div class="sidebar-header">
+        <h2>Patient Triage Board</h2>
+        <div class="filter-pills">
+          <button class="pill active" data-filter="all">All (60)</button>
+          <button class="pill" data-filter="alert">Alerts</button>
+          <button class="pill" data-filter="deferred">Deferred</button>
+          <button class="pill" data-filter="stable">Stable</button>
+        </div>
+      </div>
+
+      <div class="patient-list" id="patient-list">
+        <!-- Rendered dynamically -->
+        <div class="loading-state">Loading patient cohorts...</div>
+      </div>
+    </aside>
+
+    <!-- Right Column: Detail / Copilot View -->
+    <section class="patient-detail-view" id="patient-detail-view">
+      <!-- Empty state if none selected -->
+      <div class="empty-selection" id="empty-selection">
+        <div class="empty-icon">🩺</div>
+        <h3>Select a patient from the triage board</h3>
+        <p>Real-time vitals, trend trajectory, explainable reasoning, and RAG guidelines will display here.</p>
+      </div>
+
+      <!-- Detail Content Container -->
+      <div class="detail-container" id="detail-container" style="display: none;">
+        <!-- Patient Banner -->
+        <div class="patient-banner">
+          <div class="patient-meta">
+            <div class="patient-title-row">
+              <h2 id="detail-patient-id" class="mono">SYN-0002</h2>
+              <span id="detail-status-pill" class="status-pill status-alert">ALERT (HIGH)</span>
+              <span id="detail-ground-truth-badge" class="badge gt-badge" style="display: none;">Ground Truth Sepsis</span>
+            </div>
+            <div class="patient-attributes">
+              <span id="detail-age-sex">72 yrs • Female</span>
+              <span class="meta-divider">•</span>
+              <span id="detail-history">History: COPD, Hypertension</span>
+              <span class="meta-divider">•</span>
+              <span id="detail-meds">Meds: Beta blocker, Antihypertensive</span>
+              <span class="meta-divider">•</span>
+              <span id="detail-labs" class="mono">Creatinine: 1.7 mg/dL | WBC: 8.1k</span>
+            </div>
+          </div>
+
+          <div class="banner-quick-scores">
+            <div class="quick-score">
+              <span class="score-title">NEWS2</span>
+              <span class="score-num mono" id="detail-news2">7</span>
+            </div>
+            <div class="quick-score">
+              <span class="score-title">Shock Index</span>
+              <span class="score-num mono" id="detail-si">1.12</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Active Alert & Action Box -->
+        <div class="alert-box" id="detail-alert-box">
+          <div class="alert-box-header">
+            <div class="alert-badge-group">
+              <span class="priority-tag critical" id="detail-priority-tag">CRITICAL</span>
+              <span class="syndrome-title" id="detail-syndrome-title">HAEMODYNAMIC SHOCK DETECTED</span>
+            </div>
+            <div class="alert-cooldown-info mono" id="detail-cooldown-info">
+              Cooldown Window: Active • Dedup Protected
+            </div>
+          </div>
+
+          <!-- Plain-language Clinical Narrative -->
+          <div class="reasoning-card">
+            <h4>💡 Explainable Clinical Rationale (Evidence Fusion)</h4>
+            <div class="reasoning-body" id="detail-reasoning-text">
+              Patient demonstrates significant multi-parameter deterioration consistent with hemodynamic collapse...
+            </div>
+          </div>
+
+          <!-- Recommendations & Actionable Next Steps -->
+          <div class="recommendations-card">
+            <h4>📋 Recommended Clinical Next Steps</h4>
+            <ul id="detail-actions-list" class="actions-list">
+              <!-- Dynamically populated -->
+            </ul>
+
+            <!-- RAG Citations -->
+            <div class="rag-citations-container">
+              <div class="rag-header">📚 Retrieved Clinical Protocol Evidence (RAG Corpus):</div>
+              <div class="citations-grid" id="detail-citations-grid">
+                <!-- Dynamically populated citation chips -->
+              </div>
+            </div>
+          </div>
+
+          <!-- Clinician Action Bar -->
+          <div class="clinician-action-bar">
+            <span class="action-bar-label">Clinician Action & Feedback:</span>
+            <div class="action-buttons">
+              <button class="btn btn-action-accept" id="btn-action-accept">
+                ✓ Accept Escalation
+              </button>
+              <button class="btn btn-action-investigate" id="btn-action-investigate">
+                🔍 Investigate Bedside
+              </button>
+              <button class="btn btn-action-defer" id="btn-action-defer">
+                ⏳ Defer (10 min)
+              </button>
+              <button class="btn btn-action-dismiss" id="btn-action-dismiss">
+                ✕ Dismiss / Benign
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Telemetry & Vitals Trends Chart -->
+        <div class="chart-card">
+          <div class="chart-header">
+            <h3>📈 Multi-Parametric Telemetry & Trajectory (Last 60 Minutes)</h3>
+            <div class="chart-legend-custom">
+              <span class="legend-chip chip-hr">Heart Rate (bpm)</span>
+              <span class="legend-chip chip-sbp">Systolic BP (mmHg)</span>
+              <span class="legend-chip chip-dbp">Diastolic BP (mmHg)</span>
+              <span class="legend-chip chip-spo2">SpO2 (%)</span>
+              <span class="legend-chip chip-rr">Resp Rate (/min)</span>
+            </div>
+          </div>
+          <div class="chart-wrapper">
+            <canvas id="vitalsChart"></canvas>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Modal: Clinician Action & Feedback -->
+  <div class="modal-overlay" id="feedback-modal" style="display: none;">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="modal-title">Clinician Decision & Feedback</h3>
+        <button class="modal-close" id="btn-close-modal">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>Clinician ID / Attending:</label>
+          <input type="text" id="input-clinician-id" class="input-field" value="Dr. C. Vance, MD (ICU Attending)" readonly>
+        </div>
+
+        <div class="form-group">
+          <label>Selected Action:</label>
+          <div id="modal-action-badge" class="action-badge-preview">ACCEPT</div>
+        </div>
+
+        <div class="form-group">
+          <label>Feedback Rationale Category:</label>
+          <select id="select-feedback-category" class="input-field">
+            <option value="True Positive - Deterioration confirmed by bedside team">True Positive - Deterioration confirmed by bedside team</option>
+            <option value="True Positive - Prompted fluid challenge / Sepsis bundle">True Positive - Prompted fluid challenge / Sepsis bundle</option>
+            <option value="False Positive - Dislodged sensor or motion artifact">False Positive - Dislodged sensor or motion artifact</option>
+            <option value="Expected Chronic Baseline (e.g. baseline COPD hypoxia)">Expected Chronic Baseline (e.g. baseline COPD hypoxia)</option>
+            <option value="Transient post-exertion or anxiety response">Transient post-exertion or anxiety response</option>
+            <option value="Deferred - Under observation for trend stability">Deferred - Under observation for trend stability</option>
+            <option value="Other clinical judgment">Other clinical judgment</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label>Clinical Notes (Recorded into Audit Trail):</label>
+          <textarea id="textarea-clinical-notes" class="input-field textarea" rows="3" placeholder="Enter clinical assessment notes, bedside observations, or intervention specifics..."></textarea>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-outline" id="btn-cancel-modal">Cancel</button>
+        <button class="btn btn-primary" id="btn-submit-feedback">Confirm Decision & Log to Audit</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Audit Trail Drawer -->
+  <div class="modal-overlay" id="audit-modal" style="display: none;">
+    <div class="modal-card modal-large">
+      <div class="modal-header">
+        <div class="header-with-badge">
+          <h3>Immutable Audit Trail (Cryptographic SHA-256 Ledger)</h3>
+          <span class="chain-badge valid" id="audit-chain-badge">⛓️ Hash Chain Valid</span>
+        </div>
+        <button class="modal-close" id="btn-close-audit">✕</button>
+      </div>
+
+      <div class="audit-filters-bar">
+        <div class="filter-input-group">
+          <label>Filter Patient:</label>
+          <input type="text" id="audit-filter-patient" class="input-field-sm" placeholder="e.g. SYN-0002">
+        </div>
+        <div class="filter-input-group">
+          <label>Event Type:</label>
+          <select id="audit-filter-type" class="input-field-sm">
+            <option value="">All Events</option>
+            <option value="ALERT_DECISION">ALERT_DECISION</option>
+            <option value="CLINICIAN_ACTION">CLINICIAN_ACTION</option>
+            <option value="CLINICIAN_FEEDBACK">CLINICIAN_FEEDBACK</option>
+            <option value="VITAL_OBSERVATION">VITAL_OBSERVATION</option>
+            <option value="ARTIFACT_SUPPRESSED">ARTIFACT_SUPPRESSED</option>
+          </select>
+        </div>
+        <button class="btn btn-secondary btn-sm" id="btn-refresh-audit">🔄 Refresh</button>
+      </div>
+
+      <div class="audit-table-wrapper">
+        <table class="audit-table">
+          <thead>
+            <tr>
+              <th>Index</th>
+              <th>Timestamp</th>
+              <th>Event Type</th>
+              <th>Patient</th>
+              <th>SHA-256 Entry Hash</th>
+              <th>Payload Details</th>
+            </tr>
+          </thead>
+          <tbody id="audit-table-body">
+            <!-- Dynamically populated -->
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Benchmark Metrics Summary -->
+  <div class="modal-overlay" id="metrics-modal" style="display: none;">
+    <div class="modal-card modal-large">
+      <div class="modal-header">
+        <h3>System Evaluation & Benchmark Report</h3>
+        <button class="modal-close" id="btn-close-metrics">✕</button>
+      </div>
+      <div class="modal-body" id="metrics-modal-body">
+        <div class="loading-state">Computing benchmark evaluation across all 60 patients...</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- JavaScript App Logic -->
+  <script src="/static/app.js"></script>
+</body>
+</html>
