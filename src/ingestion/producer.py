@@ -1,93 +1,103 @@
 import argparse
 import json
 import time
+from datetime import datetime
 from pathlib import Path
 
 from confluent_kafka import Producer
 
 KAFKA_BROKER = "localhost:9092"
-TOPIC = "vitals.raw"
+VITALS_TOPIC = "vitals.raw"
 
 
-def delivery_report(err, msg):
-    """Called by Kafka when a message has been delivered."""
+def create_producer() -> Producer:
+
+    return Producer(
+        {
+            "bootstrap.servers": KAFKA_BROKER,
+            # Wait for all in-sync replicas.
+            "acks": "all",
+            # Small batching window.
+            "linger.ms": 5,
+            # Useful once the stream becomes larger.
+            "compression.type": "snappy",
+            # Retry transient failures.
+            "retries": 5,
+        }
+    )
+
+
+def delivery_report(err, message):
 
     if err is not None:
+
         print(
             f"[PRODUCER ERROR] "
-            f"topic={msg.topic()} "
-            f"partition={msg.partition()} "
+            f"topic={message.topic()} "
+            f"partition={message.partition()} "
             f"error={err}"
         )
+
         return
 
     print(
         f"[PRODUCED] "
-        f"topic={msg.topic()} "
-        f"partition={msg.partition()} "
-        f"offset={msg.offset()} "
-        f"key={msg.key().decode() if msg.key() else None}"
-    )
-
-
-def create_producer() -> Producer:
-    return Producer(
-        {
-            "bootstrap.servers": KAFKA_BROKER,
-            # Reliable delivery for local development.
-            "acks": "all",
-            # Allow batching while still being fast.
-            "linger.ms": 5,
-            # Compression helps once event volume increases.
-            "compression.type": "snappy",
-            # Retry transient broker failures.
-            "retries": 5,
-        }
+        f"patient={message.key().decode()} "
+        f"partition={message.partition()} "
+        f"offset={message.offset()}"
     )
 
 
 def publish_event(
     producer: Producer,
     event: dict,
-) -> None:
+):
 
     patient_id = event["patient_id"]
 
     producer.produce(
-        topic=TOPIC,
-        # Critical:
-        # patient_id determines Kafka partitioning.
+        topic=VITALS_TOPIC,
+        # patient_id is the Kafka key.
+        #
+        # This ensures events for the same patient
+        # are routed consistently to the same partition.
         key=patient_id,
         value=json.dumps(event).encode("utf-8"),
         callback=delivery_report,
     )
 
-    # Serve delivery callbacks.
+    # Process delivery callbacks.
     producer.poll(0)
 
 
 def replay_jsonl(
     input_file: str,
     speed: float = 60.0,
-) -> None:
-
-    producer = create_producer()
+):
 
     path = Path(input_file)
 
     if not path.exists():
-        raise FileNotFoundError(path)
+        raise FileNotFoundError(f"Input file does not exist: {path}")
 
-    print(f"[PRODUCER] Reading {path}")
-    print(f"[PRODUCER] Kafka: {KAFKA_BROKER}")
-    print(f"[PRODUCER] Topic: {TOPIC}")
+    producer = create_producer()
+
+    print(f"[PRODUCER] Input: {path}")
+
+    print(f"[PRODUCER] Broker: {KAFKA_BROKER}")
+
+    print(f"[PRODUCER] Topic: {VITALS_TOPIC}")
+
     print(f"[PRODUCER] Replay speed: {speed}x")
 
     previous_event_time = None
 
-    with path.open("r") as f:
+    with path.open("r") as file:
 
-        for line_number, line in enumerate(f, start=1):
+        for line_number, line in enumerate(
+            file,
+            start=1,
+        ):
 
             line = line.strip()
 
@@ -95,60 +105,71 @@ def replay_jsonl(
                 continue
 
             try:
+
                 event = json.loads(line)
-            except json.JSONDecodeError as e:
-                print(f"[SKIP] Invalid JSON at line " f"{line_number}: {e}")
+
+            except json.JSONDecodeError as exc:
+
+                print(f"[SKIP] Invalid JSON " f"line={line_number}: {exc}")
+
                 continue
 
-            # Preserve the generator's event-time spacing.
-            #
-            # If the generator emitted:
-            # 10:00:00
-            # 10:00:05
-            #
-            # speed=60 means:
-            # 5 simulated seconds
-            # =
-            # 5/60 real seconds
+            # -------------------------------------------------
+            # Preserve event-time spacing during replay.
+            # -------------------------------------------------
+
             current_event_time = event.get("event_time")
 
-            if previous_event_time is not None and current_event_time is not None:
+            if current_event_time is not None:
+
                 try:
-                    from datetime import datetime
 
                     current_dt = datetime.fromisoformat(
-                        current_event_time.replace("Z", "+00:00")
+                        current_event_time.replace(
+                            "Z",
+                            "+00:00",
+                        )
                     )
 
-                    delta = (current_dt - previous_event_time).total_seconds()
+                    if previous_event_time is not None:
 
-                    if delta > 0:
-                        time.sleep(delta / speed)
+                        delta = (current_dt - previous_event_time).total_seconds()
+
+                        if delta > 0:
+
+                            time.sleep(delta / speed)
 
                     previous_event_time = current_dt
 
                 except Exception:
+
+                    # Replay should continue even if
+                    # timestamp parsing fails.
                     pass
 
-            elif current_event_time is not None:
-                try:
-                    from datetime import datetime
+            # -------------------------------------------------
+            # Publish raw event.
+            # -------------------------------------------------
 
-                    previous_event_time = datetime.fromisoformat(
-                        current_event_time.replace("Z", "+00:00")
-                    )
-                except Exception:
-                    previous_event_time = None
+            try:
 
-            publish_event(
-                producer=producer,
-                event=event,
-            )
+                publish_event(
+                    producer=producer,
+                    event=event,
+                )
 
-            # Prevent local producer queue from growing forever.
-            producer.poll(0)
+            except BufferError:
 
-    print("[PRODUCER] Flushing remaining events...")
+                print("[PRODUCER] Local queue full. " "Waiting for delivery...")
+
+                producer.flush()
+
+                publish_event(
+                    producer=producer,
+                    event=event,
+                )
+
+    print("[PRODUCER] Flushing remaining messages...")
 
     producer.flush()
 
@@ -158,7 +179,7 @@ def replay_jsonl(
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
-        description="Replay generated vital events into Kafka."
+        description=("Replay generated vital events " "into Kafka.")
     )
 
     parser.add_argument(

@@ -2,23 +2,28 @@ import json
 import signal
 from datetime import datetime, timezone
 
-from confluent_kafka import Consumer, Producer, KafkaError
+from confluent_kafka import (
+    Consumer,
+    Producer,
+    KafkaError,
+)
 
-from models import VitalEvent, ValidatedVitalEvent
+from pydantic import ValidationError
+
+from models import VitalEvent
 
 KAFKA_BROKER = "localhost:9092"
 
 INPUT_TOPIC = "vitals.raw"
-VALIDATED_TOPIC = "vitals.validated"
-INVALID_TOPIC = "vitals.invalid"
+DLQ_TOPIC = "vitals.dlq"
 
 GROUP_ID = "clinical-ingestion-v1"
-
 
 running = True
 
 
 def shutdown_handler(signum, frame):
+
     global running
 
     print("\n[CONSUMER] Shutdown requested.")
@@ -26,13 +31,20 @@ def shutdown_handler(signum, frame):
     running = False
 
 
-signal.signal(signal.SIGINT, shutdown_handler)
-signal.signal(signal.SIGTERM, shutdown_handler)
+signal.signal(
+    signal.SIGINT,
+    shutdown_handler,
+)
+
+signal.signal(
+    signal.SIGTERM,
+    shutdown_handler,
+)
 
 
-# ---------------------------------------------------------
+# =========================================================
 # Kafka
-# ---------------------------------------------------------
+# =========================================================
 
 
 def create_consumer() -> Consumer:
@@ -41,11 +53,11 @@ def create_consumer() -> Consumer:
         {
             "bootstrap.servers": KAFKA_BROKER,
             "group.id": GROUP_ID,
-            # We manually commit after successful processing.
+            # We commit manually after processing.
             "enable.auto.commit": False,
-            # Start from beginning for a new local consumer group.
+            # Useful for local development.
             "auto.offset.reset": "earliest",
-            # Prevent excessively large batches.
+            # Maximum time between poll calls.
             "max.poll.interval.ms": 300000,
         }
     )
@@ -62,315 +74,395 @@ def create_producer() -> Producer:
     )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # Validation
-# ---------------------------------------------------------
+# =========================================================
 
 
-def validate_ranges(event: VitalEvent) -> list[str]:
-    """
-    Data-quality validation.
-
-    IMPORTANT:
-    These are NOT clinical risk thresholds.
-
-    A clinically concerning value can still be valid data.
-    """
+def validate_ranges(
+    event: VitalEvent,
+) -> list[str]:
 
     errors = []
 
+    # These are DATA QUALITY limits.
+    #
+    # They are NOT clinical risk thresholds.
+
     if event.heart_rate is not None:
+
         if event.heart_rate <= 0 or event.heart_rate > 300:
-            errors.append(f"invalid heart_rate={event.heart_rate}")
+
+            errors.append(f"invalid heart_rate=" f"{event.heart_rate}")
 
     if event.spo2 is not None:
+
         if event.spo2 < 0 or event.spo2 > 100:
-            errors.append(f"invalid spo2={event.spo2}")
+
+            errors.append(f"invalid spo2=" f"{event.spo2}")
 
     if event.respiratory_rate is not None:
+
         if event.respiratory_rate <= 0 or event.respiratory_rate > 150:
+
             errors.append(f"invalid respiratory_rate=" f"{event.respiratory_rate}")
 
     if event.systolic_bp is not None:
+
         if event.systolic_bp <= 0 or event.systolic_bp > 300:
+
             errors.append(f"invalid systolic_bp=" f"{event.systolic_bp}")
 
     if event.diastolic_bp is not None:
+
         if event.diastolic_bp <= 0 or event.diastolic_bp > 200:
+
             errors.append(f"invalid diastolic_bp=" f"{event.diastolic_bp}")
 
     return errors
 
 
-def validate_timestamp(event: VitalEvent) -> list[str]:
+def validate_timestamp(
+    event: VitalEvent,
+) -> list[str]:
 
     errors = []
 
     now = datetime.now(timezone.utc)
 
-    # Don't accept events more than 5 minutes
-    # into the future.
     future_seconds = (event.event_time - now).total_seconds()
 
+    # Reject events more than 5 minutes
+    # into the future.
     if future_seconds > 300:
+
         errors.append("event_time is too far in the future")
 
     return errors
 
 
-# ---------------------------------------------------------
+# =========================================================
 # Normalization
-# ---------------------------------------------------------
+# =========================================================
 
 
-def normalize_event(event: VitalEvent) -> VitalEvent:
-    """
-    Keep canonical representation in one place.
+def normalize_event(
+    event: VitalEvent,
+) -> VitalEvent:
 
-    For the current generator, most of the work is already
-    done by the Pydantic model.
-    """
+    # Pydantic has already normalized event_time
+    # to UTC.
+    #
+    # Keep this function as the boundary where
+    # future source-specific normalization can go.
 
     return event
 
 
-# ---------------------------------------------------------
-# Invalid event
-# ---------------------------------------------------------
+# =========================================================
+# Quality Control
+# =========================================================
 
 
-def publish_invalid(
+def quality_control(
+    event: VitalEvent,
+) -> list[str]:
+
+    flags = []
+
+    # Missing values are not automatically invalid.
+    #
+    # A monitor may legitimately omit a channel.
+    # Downstream components can decide how to handle
+    # missing observations.
+
+    if event.heart_rate is None:
+        flags.append("MISSING_HEART_RATE")
+
+    if event.spo2 is None:
+        flags.append("MISSING_SPO2")
+
+    if event.respiratory_rate is None:
+        flags.append("MISSING_RESPIRATORY_RATE")
+
+    if event.systolic_bp is None:
+        flags.append("MISSING_SYSTOLIC_BP")
+
+    if event.diastolic_bp is None:
+        flags.append("MISSING_DIASTOLIC_BP")
+
+    return flags
+
+
+# =========================================================
+# DLQ
+# =========================================================
+
+
+def publish_dlq(
     producer: Producer,
-    raw_event: dict,
+    raw_event,
     errors: list[str],
-) -> None:
+):
 
     payload = {
-        "received_at": datetime.now(timezone.utc).isoformat(),
+        "failed_at": datetime.now(timezone.utc).isoformat(),
         "errors": errors,
         "raw_event": raw_event,
     }
 
-    producer.produce(
-        topic=INVALID_TOPIC,
-        key=str(
+    patient_id = "unknown"
+
+    if isinstance(raw_event, dict):
+
+        patient_id = str(
             raw_event.get(
                 "patient_id",
                 "unknown",
             )
-        ),
+        )
+
+    producer.produce(
+        topic=DLQ_TOPIC,
+        key=patient_id,
         value=json.dumps(payload).encode("utf-8"),
     )
 
     producer.poll(0)
 
 
-# ---------------------------------------------------------
-# Valid event
-# ---------------------------------------------------------
+# =========================================================
+# Downstream interface
+# =========================================================
 
 
-def publish_validated(
-    producer: Producer,
+def process_valid_event(
     event: VitalEvent,
-) -> None:
+):
+    """
+    Downstream handoff.
 
-    ingested_at = datetime.now(timezone.utc)
+    For now this is just a placeholder.
 
-    latency_ms = (ingested_at - event.event_time).total_seconds() * 1000
+    Later this should call the Patient State
+    Manager / downstream component.
 
-    validated_event = ValidatedVitalEvent(
-        **event.model_dump(),
-        ingested_at=ingested_at,
-        ingestion_latency_ms=latency_ms,
-        quality_valid=True,
-        quality_flags=[],
-        normalization_version="1.0",
+    Example:
+
+        patient_state_manager.update(event)
+    """
+
+    print(
+        "[DOWNSTREAM] "
+        f"patient={event.patient_id} "
+        f"event={event.event_id} "
+        f"HR={event.heart_rate} "
+        f"SpO2={event.spo2} "
+        f"RR={event.respiratory_rate} "
+        f"BP={event.systolic_bp}/"
+        f"{event.diastolic_bp}"
     )
 
-    producer.produce(
-        topic=VALIDATED_TOPIC,
-        key=validated_event.patient_id,
-        value=validated_event.model_dump_json().encode("utf-8"),
-    )
 
-    producer.poll(0)
-
-
-# ---------------------------------------------------------
+# =========================================================
 # Main consumer loop
-# ---------------------------------------------------------
+# =========================================================
 
 
 def run():
 
     consumer = create_consumer()
-    producer = create_producer()
+
+    dlq_producer = create_producer()
 
     consumer.subscribe([INPUT_TOPIC])
 
-    print(f"[CONSUMER] Kafka: {KAFKA_BROKER}")
+    print(f"[CONSUMER] Broker: " f"{KAFKA_BROKER}")
 
-    print(f"[CONSUMER] Input: {INPUT_TOPIC}")
+    print(f"[CONSUMER] Input: " f"{INPUT_TOPIC}")
 
-    print(f"[CONSUMER] Validated: " f"{VALIDATED_TOPIC}")
-
-    print(f"[CONSUMER] Invalid: " f"{INVALID_TOPIC}")
+    print(f"[CONSUMER] DLQ: " f"{DLQ_TOPIC}")
 
     try:
 
         while running:
 
-            msg = consumer.poll(timeout=1.0)
+            message = consumer.poll(timeout=1.0)
 
-            if msg is None:
+            if message is None:
                 continue
 
-            if msg.error():
+            if message.error():
 
-                if msg.error().code() == KafkaError._PARTITION_EOF:
+                if message.error().code() == KafkaError._PARTITION_EOF:
                     continue
 
-                print(f"[KAFKA ERROR] " f"{msg.error()}")
+                print(f"[KAFKA ERROR] " f"{message.error()}")
 
                 continue
 
-            # -------------------------------------------------
+            # =================================================
             # 1. Deserialize
-            # -------------------------------------------------
+            # =================================================
 
             try:
 
-                raw_event = json.loads(msg.value().decode("utf-8"))
+                raw_event = json.loads(message.value().decode("utf-8"))
 
-            except Exception as e:
+            except Exception as exc:
 
-                print(
-                    f"[INVALID JSON] "
-                    f"partition={msg.partition()} "
-                    f"offset={msg.offset()} "
-                    f"error={e}"
-                )
+                errors = [f"invalid JSON: {exc}"]
 
-                publish_invalid(
-                    producer=producer,
+                print("[INVALID JSON] " f"{errors}")
+
+                publish_dlq(
+                    producer=dlq_producer,
                     raw_event={
-                        "raw": msg.value().decode(
+                        "raw": message.value().decode(
                             "utf-8",
                             errors="replace",
                         )
                     },
-                    errors=[f"invalid JSON: {e}"],
+                    errors=errors,
                 )
 
-                # Commit because we intentionally
-                # handled the poison message.
+                # Poison message has been handled.
                 consumer.commit(
-                    message=msg,
+                    message=message,
                     asynchronous=False,
                 )
 
                 continue
 
-            # -------------------------------------------------
+            # =================================================
             # 2. Schema validation
-            # -------------------------------------------------
+            # =================================================
 
             try:
 
                 event = VitalEvent.model_validate(raw_event)
 
-            except Exception as e:
+            except ValidationError as exc:
 
-                errors = [f"schema validation failed: {e}"]
+                errors = [
+                    "schema validation failed",
+                    str(exc),
+                ]
 
-                print(f"[SCHEMA INVALID] " f"{errors}")
+                print(
+                    "[SCHEMA INVALID] "
+                    f"patient="
+                    f"{raw_event.get('patient_id', 'unknown')} "
+                    f"errors={errors}"
+                )
 
-                publish_invalid(
-                    producer=producer,
+                publish_dlq(
+                    producer=dlq_producer,
                     raw_event=raw_event,
                     errors=errors,
                 )
 
                 consumer.commit(
-                    message=msg,
+                    message=message,
                     asynchronous=False,
                 )
 
                 continue
 
-            # -------------------------------------------------
-            # 3. Data-quality validation
-            # -------------------------------------------------
+            # =================================================
+            # 3. Range validation
+            # =================================================
 
-            errors = []
+            errors = validate_ranges(event)
 
-            errors.extend(validate_ranges(event))
+            # =================================================
+            # 4. Timestamp validation
+            # =================================================
 
             errors.extend(validate_timestamp(event))
 
             if errors:
 
                 print(
-                    f"[VALIDATION FAILED] "
+                    "[VALIDATION FAILED] "
                     f"patient={event.patient_id} "
                     f"event={event.event_id} "
                     f"errors={errors}"
                 )
 
-                publish_invalid(
-                    producer=producer,
+                publish_dlq(
+                    producer=dlq_producer,
                     raw_event=raw_event,
                     errors=errors,
                 )
 
                 consumer.commit(
-                    message=msg,
+                    message=message,
                     asynchronous=False,
                 )
 
                 continue
 
-            # -------------------------------------------------
-            # 4. Normalize
-            # -------------------------------------------------
+            # =================================================
+            # 5. Normalize
+            # =================================================
 
             event = normalize_event(event)
 
-            # -------------------------------------------------
-            # 5. Publish validated event
-            # -------------------------------------------------
+            # =================================================
+            # 6. Quality control
+            # =================================================
 
-            publish_validated(
-                producer=producer,
-                event=event,
-            )
+            quality_flags = quality_control(event)
 
-            # -------------------------------------------------
-            # 6. Commit ONLY after successful processing
-            # -------------------------------------------------
+            if quality_flags:
+
+                print(
+                    "[QUALITY FLAGS] "
+                    f"patient={event.patient_id} "
+                    f"event={event.event_id} "
+                    f"flags={quality_flags}"
+                )
+
+            # =================================================
+            # 7. Downstream handoff
+            # =================================================
+
+            try:
+
+                process_valid_event(event)
+
+            except Exception as exc:
+
+                # IMPORTANT:
+                # Do NOT commit if downstream processing
+                # fails.
+                #
+                # Kafka can then redeliver the message.
+
+                print(
+                    "[DOWNSTREAM ERROR] "
+                    f"patient={event.patient_id} "
+                    f"event={event.event_id} "
+                    f"error={exc}"
+                )
+
+                continue
+
+            # =================================================
+            # 8. Commit after successful processing
+            # =================================================
 
             consumer.commit(
-                message=msg,
+                message=message,
                 asynchronous=False,
-            )
-
-            print(
-                f"[VALID] "
-                f"patient={event.patient_id} "
-                f"event={event.event_id} "
-                f"HR={event.heart_rate} "
-                f"SpO2={event.spo2} "
-                f"RR={event.respiratory_rate} "
-                f"BP={event.systolic_bp}/"
-                f"{event.diastolic_bp}"
             )
 
     finally:
 
-        print("[CONSUMER] Flushing producer...")
+        print("[CONSUMER] Flushing DLQ producer...")
 
-        producer.flush()
+        dlq_producer.flush()
 
         print("[CONSUMER] Closing consumer...")
 
