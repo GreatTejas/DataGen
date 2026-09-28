@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clinical-reasoning"
+version = "0.1.0"
+description = "Clinical Knowledge (RAG) + Clinical Reasoning Agent for the Agentic Clinical Deterioration Copilot (Person 4)"
+requires-python = ">=3.10"
+dependencies = [
+    "scikit-learn>=1.3",
+    "numpy>=1.24",
+    "anthropic>=0.34",
+]
+
+[project.scripts]
+clinical-reasoning = "clinical_reasoning.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,14 @@
+{
+  "model": "claude-sonnet-4-6",
+  "max_tool_iterations": 6,
+  "rag": {
+    "backend": "tfidf",
+    "top_k_default": 3,
+    "max_chunk_chars": 500,
+    "overlap_sentences": 1
+  },
+  "experience_memory": {
+    "top_k_default": 3,
+    "note": "backed by StubExperienceMemoryClient until Person 2/3 ship the real store"
+  }
+}
