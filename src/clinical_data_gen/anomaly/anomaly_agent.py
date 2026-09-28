@@ -1,4 +1,4 @@
-"""Anomaly agent combining patient-state features with online learning."""
+"""Online anomaly detection agent."""
 
 from __future__ import annotations
 
@@ -11,14 +11,13 @@ from clinical_data_gen.anomaly.features import (
 )
 from clinical_data_gen.learning.online_logistic_regression import (
     OnlineLogisticRegression,
-    OnlinePrediction,
 )
 from clinical_data_gen.state.patient_state import PatientState
 
 
 @dataclass(frozen=True)
 class AnomalyResult:
-    """Result produced for one patient-state observation."""
+    """Result produced by the anomaly agent."""
 
     patient_id: str
     timestamp: Any
@@ -31,162 +30,299 @@ class AnomalyResult:
 
 class AnomalyAgent:
     """
-    Online anomaly-learning agent.
+    Online anomaly detection agent.
 
-    The lifecycle for a labelled observation is:
+    Pipeline:
 
-        result = agent.predict(state)
-        agent.update(state, label)
+        PatientState
+            ↓
+        PatientFeatureExtractor
+            ↓
+        OnlineLogisticRegression
+            ↓
+        AnomalyResult
 
-    Prediction always happens before learning from the label.
-    This prevents the current label from leaking into its prediction.
+    The logistic-regression model is global.
+
+    Patient-specific temporal context is supplied through
+    PatientState.recent_history.
     """
 
     def __init__(
         self,
         *,
-        feature_extractor: PatientFeatureExtractor | None = None,
+        history_window: int = 6,
         learning_rate: float = 0.05,
         l2: float = 1e-4,
         positive_class_weight: float = 1.0,
-        gradient_clip: float = 5.0,
-        probability_threshold: float = 0.5,
+        gradient_clip: float | None = 5.0,
+        threshold: float = 0.5,
         diminishing_learning_rate: bool = True,
     ) -> None:
-        self.feature_extractor = (
-            feature_extractor
-            if feature_extractor is not None
-            else PatientFeatureExtractor()
+        """
+        Initialize the anomaly agent.
+
+        Parameters
+        ----------
+        history_window:
+            Number of previous observations used to construct temporal
+            features.
+
+        learning_rate:
+            Initial learning rate for online logistic regression.
+
+        l2:
+            L2 regularization strength.
+
+        positive_class_weight:
+            Weight applied to positive examples during online updates.
+
+        gradient_clip:
+            Maximum absolute gradient component.
+
+        threshold:
+            Probability threshold used only by the anomaly agent to convert
+            probability into a binary anomaly decision.
+
+        diminishing_learning_rate:
+            Whether the learning rate decreases as updates accumulate.
+        """
+        if history_window < 1:
+            raise ValueError(
+                "history_window must be at least 1"
+            )
+
+        if not 0.0 < threshold < 1.0:
+            raise ValueError(
+                "threshold must be between 0 and 1"
+            )
+
+        self.history_window = history_window
+        self.threshold = threshold
+
+        self.feature_extractor = PatientFeatureExtractor(
+            history_window=history_window,
         )
 
         self.model = OnlineLogisticRegression(
-            n_features=self.feature_extractor.n_features,
+            n_features=self.feature_extractor.feature_count,
             learning_rate=learning_rate,
             l2=l2,
             positive_class_weight=positive_class_weight,
             gradient_clip=gradient_clip,
-            probability_threshold=probability_threshold,
             diminishing_learning_rate=diminishing_learning_rate,
         )
 
-    @property
-    def model_version(self) -> int:
-        return self.model.model_version
+    # ------------------------------------------------------------------
+    # Prediction
+    # ------------------------------------------------------------------
 
-    @property
-    def update_count(self) -> int:
-        return self.model.update_count
-
-    @property
-    def feature_names(self) -> tuple[str, ...]:
-        return self.feature_extractor.feature_names
-
-    def predict(self, state: PatientState) -> AnomalyResult:
+    def predict(
+        self,
+        state: PatientState,
+    ) -> AnomalyResult:
         """
         Predict anomaly probability for the current patient state.
 
-        No label or future information is used here.
+        This method does not update the model.
         """
+        features = self.feature_extractor.extract(state)
 
-        feature_vector = self.feature_extractor.extract(state)
-
-        prediction = self.model.predict(feature_vector.values)
-
-        contributing_features = self._get_contributing_features(
-            feature_vector,
+        prediction = self.model.predict(
+            features.values,
         )
 
-        return AnomalyResult(
-            patient_id=str(getattr(state, "patient_id", "")),
-            timestamp=getattr(state, "timestamp", None),
+        return self._build_result(
+            state=state,
+            features=features,
             probability=prediction.probability,
-            is_anomalous=bool(prediction.predicted_label),
-            feature_vector=feature_vector.as_dict(),
-            contributing_features=contributing_features,
-            model_version=prediction.model_version,
+            is_anomalous=(
+                prediction.probability >= self.threshold
+            ),
         )
+
+    def predict_features(
+        self,
+        features: FeatureVector,
+    ):
+        """
+        Predict directly from an already extracted feature vector.
+
+        Useful for evaluation and debugging.
+        """
+        return self.model.predict(
+            features.values,
+        )
+
+    # ------------------------------------------------------------------
+    # Online update
+    # ------------------------------------------------------------------
 
     def update(
         self,
+        *,
         state: PatientState,
-        label: int,
-    ) -> float:
+        feedback: int | bool,
+    ) -> AnomalyResult:
         """
-        Update the online model using an explicit binary anomaly label.
+        Update the online model using an explicit anomaly label.
 
-        Returns the pre-update logistic loss.
+        feedback must represent anomaly truth:
 
-        This method intentionally requires an explicit label. In the live
-        pipeline, clinician feedback should only be converted into an
-        anomaly label when the feedback semantics explicitly support that.
+            1 / True  -> anomalous
+            0 / False -> not anomalous
+
+        Clinician actions such as accept/dismiss are intentionally not
+        interpreted here as anomaly labels.
         """
+        label = self._validate_label(
+            feedback,
+        )
 
-        feature_vector = self.feature_extractor.extract(state)
+        features = self.feature_extractor.extract(
+            state,
+        )
 
-        return self.model.update(
-            feature_vector.values,
+        prediction = self.model.predict(
+            features.values,
+        )
+
+        self.model.update(
+            features.values,
             label,
+        )
+
+        return self._build_result(
+            state=state,
+            features=features,
+            probability=prediction.probability,
+            is_anomalous=(
+                prediction.probability >= self.threshold
+            ),
         )
 
     def predict_and_update(
         self,
+        *,
         state: PatientState,
-        label: int,
-    ) -> tuple[AnomalyResult, float]:
+        feedback: int | bool,
+    ) -> AnomalyResult:
         """
-        Convenience method for prequential evaluation.
-
-        The prediction is generated first and the model is updated second.
+        Predict and then update the model from an explicit anomaly label.
         """
+        return self.update(
+            state=state,
+            feedback=feedback,
+        )
 
-        result = self.predict(state)
-        loss = self.update(state, label)
+    # ------------------------------------------------------------------
+    # Result construction
+    # ------------------------------------------------------------------
 
-        return result, loss
-
-    def predict_features(
+    def _build_result(
         self,
-        feature_vector: FeatureVector,
-    ) -> OnlinePrediction:
-        """Predict directly from an already extracted feature vector."""
+        *,
+        state: PatientState,
+        features: FeatureVector,
+        probability: float,
+        is_anomalous: bool,
+    ) -> AnomalyResult:
+        """Construct the public anomaly result."""
+        patient_id = getattr(
+            state,
+            "patient_id",
+            "",
+        )
 
-        if len(feature_vector) != self.feature_extractor.n_features:
-            raise ValueError(
-                "Feature vector size does not match the agent model"
-            )
+        timestamp = getattr(
+            state,
+            "timestamp",
+            None,
+        )
 
-        return self.model.predict(feature_vector.values)
+        return AnomalyResult(
+            patient_id=str(patient_id),
+            timestamp=timestamp,
+            probability=float(probability),
+            is_anomalous=bool(is_anomalous),
+            feature_vector=features.as_dict(),
+            contributing_features=(
+                self._top_contributing_features(
+                    features,
+                )
+            ),
+            model_version=self.model.model_version,
+        )
 
-    def _get_contributing_features(
+    # ------------------------------------------------------------------
+    # Feature attribution
+    # ------------------------------------------------------------------
+
+    def _top_contributing_features(
         self,
-        feature_vector: FeatureVector,
+        features: FeatureVector,
+        top_k: int = 5,
     ) -> list[str]:
         """
-        Return features with the largest absolute weighted contribution.
+        Return features with the largest absolute linear contribution.
 
-        This is an interpretability aid, not a causal explanation.
+        Contribution is approximated as:
+
+            weight × feature_value
         """
+        weights = self.model.weights
 
-        contributions = []
+        if not weights:
+            return []
 
-        for name, value, weight in zip(
-            feature_vector.names,
-            feature_vector.values,
-            self.model.weights,
+        contributions: list[tuple[str, float]] = []
+
+        for index, (name, value) in enumerate(
+            zip(
+                features.names,
+                features.values,
+            )
         ):
-            contribution = float(value) * float(weight)
+            if index >= len(weights):
+                break
 
-            if contribution != 0.0:
-                contributions.append(
-                    (name, abs(contribution))
+            contribution = (
+                weights[index] * value
+            )
+
+            contributions.append(
+                (
+                    name,
+                    contribution,
                 )
+            )
 
         contributions.sort(
-            key=lambda item: item[1],
+            key=lambda item: abs(item[1]),
             reverse=True,
         )
 
         return [
             name
-            for name, _ in contributions[:5]
+            for name, _ in contributions[:top_k]
         ]
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_label(
+        feedback: int | bool,
+    ) -> int:
+        """Validate and normalize a binary anomaly label."""
+        if isinstance(feedback, bool):
+            return int(feedback)
+
+        if isinstance(feedback, int) and feedback in (0, 1):
+            return feedback
+
+        raise ValueError(
+            "feedback must be a binary anomaly label: "
+            "0, 1, False, or True"
+        )

@@ -1,9 +1,9 @@
-"""Feature extraction for the online anomaly-learning pipeline."""
+"""Feature extraction for the online anomaly detection model."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Any
 
 from clinical_data_gen.preprocessing.constants import CORE_VITALS
 from clinical_data_gen.state.patient_state import PatientState
@@ -11,214 +11,294 @@ from clinical_data_gen.state.patient_state import PatientState
 
 @dataclass(frozen=True)
 class FeatureVector:
-    """Named feature vector consumed by the online learning model."""
+    """Numeric feature vector consumed by the anomaly model."""
 
-    names: tuple[str, ...]
-    values: tuple[float, ...]
+    values: list[float]
+    names: list[str]
 
     def as_dict(self) -> dict[str, float]:
+        """Return feature names mapped to feature values."""
         return dict(zip(self.names, self.values))
 
     def __len__(self) -> int:
         return len(self.values)
 
 
-# Fixed numerical scales keep heterogeneous physiological measurements
-# in a comparable range without fitting anything on the evaluation stream.
-_DEFAULT_SCALES: Mapping[str, tuple[float, float]] = {
-    "HR": (80.0, 30.0),
-    "O2Sat": (97.0, 5.0),
-    "Temp": (37.0, 1.0),
-    "SBP": (120.0, 30.0),
-    "MAP": (80.0, 20.0),
-    "DBP": (70.0, 20.0),
-    "Resp": (18.0, 8.0),
-}
-
-_AGE_SCALE = (60.0, 20.0)
-
-
 class PatientFeatureExtractor:
     """
-    Convert PatientState into a deterministic numerical feature vector.
+    Convert PatientState into a fixed-dimensional temporal feature vector.
 
-    Features include:
+    For each of the seven critical vitals, the model receives:
 
-    - normalized current vital values
-    - explicit missingness indicators
-    - explicit imputation indicators
-    - short-term change from the previous observation
-    - static patient context when available
+    - current normalized value
+    - previous normalized values at t-1 ... t-history_window
+    - current missing flag
+    - current imputed flag
 
-    Missing values are represented numerically as zero after normalization,
-    while their missingness is preserved by a separate feature.
+    Static patient/context features are also included.
+
+    Historical positions are preserved. A missing observation at t-k does
+    not cause older observations to shift forward into that lag.
+
+    The history window contains previous patient states only.
+    The current state is handled separately.
     """
 
-    def __init__(self) -> None:
-        self._feature_names = self._build_feature_names()
+    NORMALIZATION: dict[str, tuple[float, float]] = {
+        "HR": (80.0, 30.0),
+        "O2Sat": (97.0, 5.0),
+        "Temp": (37.0, 1.0),
+        "SBP": (120.0, 30.0),
+        "MAP": (80.0, 20.0),
+        "DBP": (70.0, 20.0),
+        "Resp": (18.0, 8.0),
+    }
 
-    @property
-    def feature_names(self) -> tuple[str, ...]:
-        return self._feature_names
+    STATIC_FEATURES = ("Age", "Gender", "Unit1", "Unit2")
 
-    @property
-    def n_features(self) -> int:
-        return len(self._feature_names)
+    def __init__(self, history_window: int = 6) -> None:
+        if history_window < 1:
+            raise ValueError("history_window must be at least 1")
+
+        self.history_window = history_window
 
     def extract(self, state: PatientState) -> FeatureVector:
-        """Extract the complete feature vector from a PatientState."""
+        """
+        Extract the complete feature vector from the current patient state.
 
-        names: list[str] = []
+        Feature ordering is deterministic:
+
+        For every critical vital:
+            <vital>_current
+            <vital>_lag_1
+            ...
+            <vital>_lag_N
+            <vital>_missing
+            <vital>_imputed
+
+        Followed by:
+            Age
+            Gender
+            Unit1
+            Unit2
+        """
         values: list[float] = []
+        names: list[str] = []
 
         for vital_name in CORE_VITALS:
-            observation = state.get_vital(vital_name)
-
-            current_value = (
-                float(observation.value)
-                if observation.value is not None
-                else 0.0
-            )
-
-            center, scale = _DEFAULT_SCALES[vital_name]
-
-            if observation.value is None or observation.is_missing:
-                normalized_value = 0.0
-            else:
-                normalized_value = (current_value - center) / scale
-
-            names.append(f"{vital_name}.value")
-            values.append(normalized_value)
-
-            names.append(f"{vital_name}.missing")
-            values.append(
-                1.0
-                if observation.value is None or observation.is_missing
-                else 0.0
-            )
-
-            names.append(f"{vital_name}.imputed")
-            values.append(
-                1.0 if observation.is_imputed else 0.0
-            )
-
-            previous_value = self._previous_vital_value(
+            current_value = self._get_current_value(
                 state,
                 vital_name,
             )
 
-            if (
-                previous_value is None
-                or observation.value is None
-                or observation.is_missing
-            ):
-                delta = 0.0
-            else:
-                delta = (current_value - previous_value) / scale
+            current_missing = self._is_current_missing(
+                state,
+                vital_name,
+            )
 
-            names.append(f"{vital_name}.delta")
-            values.append(delta)
+            current_imputed = self._is_current_imputed(
+                state,
+                vital_name,
+            )
 
-        self._append_static_context(state, names, values)
-
-        return FeatureVector(
-            names=tuple(names),
-            values=tuple(values),
-        )
-
-    def _append_static_context(
-        self,
-        state: PatientState,
-        names: list[str],
-        values: list[float],
-    ) -> None:
-        """Append available static patient context."""
-
-        context = state.static_context
-
-        age = getattr(context, "age", None)
-
-        names.append("Age")
-        if age is None:
-            values.append(0.0)
-        else:
-            center, scale = _AGE_SCALE
-            values.append((float(age) - center) / scale)
-
-        gender = getattr(context, "gender", None)
-
-        names.append("Gender")
-        values.append(self._encode_gender(gender))
-
-        unit1 = getattr(context, "unit1", None)
-
-        names.append("Unit1")
-        values.append(self._encode_binary(unit1))
-
-        unit2 = getattr(context, "unit2", None)
-
-        names.append("Unit2")
-        values.append(self._encode_binary(unit2))
-
-    @staticmethod
-    def _previous_vital_value(
-        state: PatientState,
-        vital_name: str,
-    ) -> float | None:
-        """
-        Retrieve the previous value for a vital when state history exists.
-
-        PatientState implementations may expose history as snapshots.
-        Unsupported history representations simply result in no delta.
-        """
-
-        history = getattr(state, "recent_history", None)
-
-        if not history:
-            return None
-
-        for previous_state in reversed(history):
-            if isinstance(previous_state, PatientState):
-                observation = previous_state.get_vital(vital_name)
-
-                if (
-                    observation.value is not None
-                    and not observation.is_missing
-                ):
-                    return float(observation.value)
-
-            elif isinstance(previous_state, dict):
-                value = PatientFeatureExtractor._value_from_mapping(
-                    previous_state,
+            # Current value.
+            values.append(
+                self._normalize(
                     vital_name,
+                    current_value,
+                )
+            )
+            names.append(f"{vital_name}_current")
+
+            # Explicit historical lag values.
+            history_values = self._get_history_values(
+                state,
+                vital_name,
+            )
+
+            for lag in range(1, self.history_window + 1):
+                lag_value = self._get_lag_value(
+                    history_values,
+                    lag,
                 )
 
-                if value is not None:
-                    return value
+                values.append(
+                    self._normalize(
+                        vital_name,
+                        lag_value,
+                    )
+                )
+                names.append(f"{vital_name}_lag_{lag}")
 
-        return None
+            # Current missingness / imputation indicators.
+            values.append(float(current_missing))
+            names.append(f"{vital_name}_missing")
+
+            values.append(float(current_imputed))
+            names.append(f"{vital_name}_imputed")
+
+        # Static patient/context features.
+        static_values = self._extract_static_context(state)
+
+        for name, value in static_values:
+            values.append(value)
+            names.append(name)
+
+        return FeatureVector(
+            values=values,
+            names=names,
+        )
+
+    # ------------------------------------------------------------------
+    # Current-state helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def _value_from_mapping(
-        snapshot: dict,
+    def _get_current_value(
+        state: PatientState,
         vital_name: str,
     ) -> float | None:
-        """Extract a vital from dictionary-based historical snapshots."""
+        observation = state.current_vitals.get(vital_name)
 
-        vitals = snapshot.get("current_vitals")
-
-        if not isinstance(vitals, dict):
+        if observation is None:
             return None
 
-        observation = vitals.get(vital_name)
+        if observation.value is None:
+            return None
+
+        try:
+            return float(observation.value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _is_current_missing(
+        state: PatientState,
+        vital_name: str,
+    ) -> bool:
+        observation = state.current_vitals.get(vital_name)
+
+        if observation is None:
+            return True
+
+        return (
+            observation.value is None
+            or observation.is_missing
+        )
+
+    @staticmethod
+    def _is_current_imputed(
+        state: PatientState,
+        vital_name: str,
+    ) -> bool:
+        observation = state.current_vitals.get(vital_name)
+
+        if observation is None:
+            return False
+
+        return observation.is_imputed
+
+    # ------------------------------------------------------------------
+    # Historical lag helpers
+    # ------------------------------------------------------------------
+
+    def _get_history_values(
+        self,
+        state: PatientState,
+        vital_name: str,
+    ) -> list[float | None]:
+        """
+        Return historical values in chronological order.
+
+        The returned list contains the most recent history_window
+        observations available in PatientState.recent_history.
+
+        Missing values are retained as None so that lag positions remain
+        aligned with the actual observation sequence.
+        """
+        history = list(state.recent_history)
+
+        if not history:
+            return []
+
+        history = history[-self.history_window :]
+
+        return [
+            self._get_snapshot_value(
+                snapshot,
+                vital_name,
+            )
+            for snapshot in history
+        ]
+
+    @staticmethod
+    def _get_lag_value(
+        history_values: list[float | None],
+        lag: int,
+    ) -> float | None:
+        """
+        Return the value corresponding to a specific lag.
+
+        history_values is chronological:
+            [oldest, ..., previous]
+
+        Therefore:
+            lag=1 -> most recent previous observation
+            lag=2 -> second most recent observation
+            ...
+        """
+        if lag < 1:
+            raise ValueError("lag must be at least 1")
+
+        if lag > len(history_values):
+            return None
+
+        index = len(history_values) - lag
+        return history_values[index]
+
+    @staticmethod
+    def _get_snapshot_value(
+        snapshot: Any,
+        vital_name: str,
+    ) -> float | None:
+        """
+        Extract a vital value from a historical PatientState snapshot.
+
+        Supports both PatientState-like snapshots and dictionary snapshots.
+        """
+        current_vitals = getattr(
+            snapshot,
+            "current_vitals",
+            None,
+        )
+
+        if current_vitals is None and isinstance(snapshot, dict):
+            current_vitals = snapshot.get("current_vitals")
+
+        if not current_vitals:
+            return None
+
+        observation = current_vitals.get(vital_name)
+
+        if observation is None:
+            return None
 
         if isinstance(observation, dict):
-            if observation.get("is_missing", False):
+            value = observation.get("value")
+
+            if value is None:
                 return None
 
-            value = observation.get("value")
-        else:
-            value = observation
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        value = getattr(
+            observation,
+            "value",
+            None,
+        )
 
         if value is None:
             return None
@@ -228,74 +308,113 @@ class PatientFeatureExtractor:
         except (TypeError, ValueError):
             return None
 
-    @staticmethod
-    def _encode_gender(value: object) -> float:
-        """Encode the dataset's binary gender field."""
+    # ------------------------------------------------------------------
+    # Static context
+    # ------------------------------------------------------------------
 
+    @staticmethod
+    def _extract_static_context(
+        state: PatientState,
+    ) -> list[tuple[str, float]]:
+        context = state.static_context
+
+        return [
+            (
+                "Age",
+                PatientFeatureExtractor._to_float(
+                    getattr(context, "age", None),
+                ),
+            ),
+            (
+                "Gender",
+                PatientFeatureExtractor._to_float(
+                    getattr(context, "gender", None),
+                ),
+            ),
+            (
+                "Unit1",
+                PatientFeatureExtractor._to_float(
+                    getattr(context, "unit1", None),
+                ),
+            ),
+            (
+                "Unit2",
+                PatientFeatureExtractor._to_float(
+                    getattr(context, "unit2", None),
+                ),
+            ),
+        ]
+
+    @staticmethod
+    def _to_float(value: Any) -> float:
         if value is None:
             return 0.0
 
         if isinstance(value, bool):
             return float(value)
-
-        text = str(value).strip().lower()
-
-        if text in {"1", "m", "male"}:
-            return 1.0
-
-        if text in {"0", "f", "female"}:
-            return 0.0
 
         try:
-            numeric = float(text)
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
 
-            if numeric in (0.0, 1.0):
-                return numeric
-        except ValueError:
-            pass
+    # ------------------------------------------------------------------
+    # Normalization
+    # ------------------------------------------------------------------
 
-        return 0.0
+    @classmethod
+    def _normalize(
+        cls,
+        vital_name: str,
+        value: float | None,
+    ) -> float:
+        """
+        Normalize a vital using the configured physiological center/scale.
 
-    @staticmethod
-    def _encode_binary(value: object) -> float:
-        """Encode Unit1/Unit2-style binary context."""
-
+        Missing values are represented as 0.0 here. Their missingness is
+        separately represented by the <vital>_missing feature.
+        """
         if value is None:
             return 0.0
 
-        if isinstance(value, bool):
+        center_scale = cls.NORMALIZATION.get(vital_name)
+
+        if center_scale is None:
             return float(value)
 
-        text = str(value).strip().lower()
+        center, scale = center_scale
 
-        if text in {"1", "true", "yes"}:
-            return 1.0
-
-        return 0.0
-
-    @staticmethod
-    def _build_feature_names() -> tuple[str, ...]:
-        """Build the stable feature ordering used by the model."""
-
-        names: list[str] = []
-
-        for vital_name in CORE_VITALS:
-            names.extend(
-                [
-                    f"{vital_name}.value",
-                    f"{vital_name}.missing",
-                    f"{vital_name}.imputed",
-                    f"{vital_name}.delta",
-                ]
+        if scale <= 0:
+            raise ValueError(
+                f"Normalization scale must be positive for {vital_name}"
             )
 
-        names.extend(
-            [
-                "Age",
-                "Gender",
-                "Unit1",
-                "Unit2",
-            ]
+        return (float(value) - center) / scale
+
+    # ------------------------------------------------------------------
+    # Model dimensionality
+    # ------------------------------------------------------------------
+
+    @property
+    def feature_count(self) -> int:
+        """
+        Number of features produced by this extractor.
+
+        Per vital:
+            1 current value
+            history_window lag values
+            1 missing flag
+            1 imputed flag
+
+        Plus four static features.
+        """
+        per_vital = (
+            1
+            + self.history_window
+            + 2
         )
 
-        return tuple(names)
+        return (
+            len(CORE_VITALS) * per_vital
+            + len(self.STATIC_FEATURES)
+        )

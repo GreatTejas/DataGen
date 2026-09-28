@@ -1,96 +1,100 @@
-"""Run online logistic-regression evaluation on PSV patient streams."""
+"""Evaluate the online logistic-regression anomaly model on PSV data."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import sys
 import time
+from math import log
 from pathlib import Path
 
 from clinical_data_gen.anomaly.anomaly_agent import AnomalyAgent
-from clinical_data_gen.evaluation.runner import OnlineEvaluationRunner
+from clinical_data_gen.evaluation.online_metrics import OnlineMetricsEvaluator
 from clinical_data_gen.evaluation.stream import (
-    PSVEvaluationStream,
+    EvaluationSample,
     discover_psv_files,
+    evaluate_psv_file,
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate the online logistic-regression anomaly "
-            "agent on PSV patient streams."
+            "Evaluate online logistic regression on PSV data "
+            "with configurable temporal history."
         )
     )
 
     parser.add_argument(
         "--input",
-        type=Path,
         required=True,
-        help=(
-            "Directory containing patient PSV files, "
-            "or a single PSV file."
-        ),
+        help="PSV file or directory containing PSV files.",
     )
 
     parser.add_argument(
         "--output",
-        type=Path,
         required=True,
-        help="Directory where evaluation artifacts are written.",
+        help="Directory where evaluation results will be written.",
+    )
+
+    parser.add_argument(
+        "--history-window",
+        type=int,
+        default=6,
+        help=(
+            "Number of previous observations used to construct "
+            "temporal features. Default: 6."
+        ),
     )
 
     parser.add_argument(
         "--learning-rate",
         type=float,
         default=0.05,
-        help="Initial online learning rate.",
+        help="Initial online learning rate. Default: 0.05.",
     )
 
     parser.add_argument(
         "--l2",
         type=float,
         default=1e-4,
-        help="L2 regularization strength.",
+        help="L2 regularization strength. Default: 1e-4.",
     )
 
     parser.add_argument(
         "--positive-class-weight",
         type=float,
         default=1.0,
-        help="Weight applied to positive examples.",
+        help="Weight applied to positive examples. Default: 1.0.",
     )
 
     parser.add_argument(
         "--gradient-clip",
         type=float,
         default=5.0,
-        help="Maximum absolute gradient component.",
+        help="Maximum absolute gradient component. Default: 5.0.",
     )
 
     parser.add_argument(
         "--threshold",
         type=float,
         default=0.5,
-        help="Probability threshold for binary predictions.",
+        help="Anomaly probability threshold. Default: 0.5.",
     )
 
     parser.add_argument(
         "--constant-learning-rate",
         action="store_true",
-        help=(
-            "Disable diminishing learning rate and use "
-            "the configured learning rate for every update."
-        ),
+        help="Disable diminishing learning rate.",
     )
 
     parser.add_argument(
         "--progress-every",
         type=int,
-        default=100,
+        default=10_000,
         help=(
-            "Update the terminal progress display every N patients."
+            "Print progress after this many observations. "
+            "Default: 10000."
         ),
     )
 
@@ -98,357 +102,524 @@ def parse_args() -> argparse.Namespace:
         "--max-patients",
         type=int,
         default=None,
-        help="Maximum number of patient files to evaluate. "
-            "Useful for fast development runs; default is all patients.",
+        help="Optional maximum number of patients to evaluate.",
+    )
+
+    parser.add_argument(
+        "--max-forward-fill",
+        type=int,
+        default=3,
+        help=(
+            "Maximum forward-fill length for supported vitals. "
+            "Default: 3."
+        ),
     )
 
     return parser.parse_args()
 
 
-def build_agent(args: argparse.Namespace) -> AnomalyAgent:
-    """Create the online anomaly agent."""
+def _validate_args(args: argparse.Namespace) -> None:
+    if args.history_window < 1:
+        raise ValueError(
+            "--history-window must be at least 1"
+        )
 
+    if args.max_forward_fill < 0:
+        raise ValueError(
+            "--max-forward-fill must be non-negative"
+        )
+
+    if args.progress_every < 1:
+        raise ValueError(
+            "--progress-every must be at least 1"
+        )
+
+    if args.max_patients is not None and args.max_patients < 1:
+        raise ValueError(
+            "--max-patients must be at least 1"
+        )
+
+    if args.positive_class_weight <= 0:
+        raise ValueError(
+            "--positive-class-weight must be greater than 0"
+        )
+
+    if args.learning_rate <= 0:
+        raise ValueError(
+            "--learning-rate must be greater than 0"
+        )
+
+    if args.l2 < 0:
+        raise ValueError(
+            "--l2 must be non-negative"
+        )
+
+    if args.gradient_clip is not None and args.gradient_clip <= 0:
+        raise ValueError(
+            "--gradient-clip must be greater than 0"
+        )
+
+    if not 0.0 < args.threshold < 1.0:
+        raise ValueError(
+            "--threshold must be between 0 and 1"
+        )
+
+
+def _create_agent(args: argparse.Namespace) -> AnomalyAgent:
+    """Create the anomaly agent using CLI configuration."""
     return AnomalyAgent(
+        history_window=args.history_window,
         learning_rate=args.learning_rate,
         l2=args.l2,
         positive_class_weight=args.positive_class_weight,
         gradient_clip=args.gradient_clip,
-        probability_threshold=args.threshold,
-        diminishing_learning_rate=(
-            not args.constant_learning_rate
-        ),
+        threshold=args.threshold,
+        diminishing_learning_rate=not args.constant_learning_rate,
     )
 
 
-def write_run_metadata(
-    output_dir: Path,
+def _evaluate_patient(
     *,
-    args: argparse.Namespace,
-    patient_files: list[Path],
+    psv_file: Path,
     agent: AnomalyAgent,
-) -> None:
-    """Write reproducibility metadata for the evaluation run."""
+    evaluator: OnlineMetricsEvaluator,
+    history_window: int,
+    max_forward_fill: int,
+    progress_every: int,
+    processed_observations: int,
+    total_observations: int,
+    start_time: float,
+) -> tuple[int, int]:
+    """
+    Evaluate one patient sequentially.
 
-    metadata = {
-        "input": str(args.input),
-        "patient_file_count": len(patient_files),
-        "model": "online_logistic_regression",
-        "learning_rate": args.learning_rate,
-        "l2": args.l2,
-        "positive_class_weight": args.positive_class_weight,
-        "gradient_clip": args.gradient_clip,
-        "probability_threshold": args.threshold,
-        "diminishing_learning_rate": (
-            not args.constant_learning_rate
-        ),
-        "feature_count": agent.feature_extractor.n_features,
-        "feature_names": list(
-            agent.feature_extractor.feature_names
-        ),
-        "evaluation_protocol": "prequential",
-    }
+    For every observation:
 
-    (output_dir / "run_metadata.json").write_text(
-        json.dumps(
-            metadata,
-            indent=2,
-        ),
-        encoding="utf-8",
+        1. construct PatientState
+        2. predict using current state + historical context
+        3. record prediction against evaluation-only label
+        4. update online model using the label
+
+    The label is used only for offline/prequential evaluation.
+    """
+    patient_observations = 0
+
+    for sample in evaluate_psv_file(
+        psv_file,
+        history_window=history_window,
+        max_forward_fill=max_forward_fill,
+    ):
+        _process_sample(
+            sample=sample,
+            agent=agent,
+            evaluator=evaluator,
+        )
+
+        patient_observations += 1
+        processed_observations += 1
+
+        if processed_observations % progress_every == 0:
+            _print_progress(
+                evaluator=evaluator,
+                processed_observations=processed_observations,
+                total_observations=total_observations,
+                start_time=start_time,
+            )
+
+    return patient_observations, processed_observations
+
+
+def _binary_log_loss(
+    probability: float,
+    label: int,
+) -> float:
+    """
+    Calculate binary cross-entropy for one prediction.
+
+    This matches the definition used by OnlineMetricsEvaluator.
+    """
+    epsilon = 1e-15
+
+    probability = min(
+        max(probability, epsilon),
+        1.0 - epsilon,
     )
 
+    if label == 1:
+        return -log(probability)
 
-def _format_duration(seconds: float) -> str:
-    """Format seconds as HH:MM:SS."""
-
-    seconds = max(0, int(seconds))
-
-    hours, remainder = divmod(seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-
-    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return -log(1.0 - probability)
 
 
-def _progress_bar(
-    current: int,
-    total: int,
-    width: int = 35,
-) -> str:
-    """Build a terminal progress bar."""
+def _process_sample(
+    *,
+    sample: EvaluationSample,
+    agent: AnomalyAgent,
+    evaluator: OnlineMetricsEvaluator,
+) -> None:
+    """
+    Perform one prequential prediction/update step.
 
-    if total <= 0:
-        return "[" + ("?" * width) + "]"
+    Prediction happens before the label is used for updating the model.
+    """
+    # ---------------------------------------------------------------
+    # 1. Predict using the model BEFORE learning from this label.
+    # ---------------------------------------------------------------
+    result = agent.predict(sample.state)
 
-    ratio = min(max(current / total, 0.0), 1.0)
-    filled = int(width * ratio)
+    # Capture the model version associated with this prediction.
+    model_version = agent.model.model_version
 
-    return (
-        "["
-        + ("#" * filled)
-        + ("-" * (width - filled))
-        + "]"
+    # Calculate the loss of this prediction against the evaluation label.
+    loss = _binary_log_loss(
+        result.probability,
+        sample.label,
+    )
+
+    # ---------------------------------------------------------------
+    # 2. Record the prediction.
+    #
+    # The threshold is used only to derive the binary predicted label
+    # for evaluation. It does not affect the probability itself.
+    # ---------------------------------------------------------------
+    evaluator.add_prediction(
+        probability=result.probability,
+        true_label=sample.label,
+        patient_id=sample.state.patient_id,
+        timestamp=sample.state.timestamp,
+        loss=loss,
+        model_version=model_version,
+        threshold=agent.threshold,
+    )
+
+    # ---------------------------------------------------------------
+    # 3. Update the online model AFTER recording the prediction.
+    #
+    # SepsisLabel is used here only as the simulated delayed label for
+    # offline/prequential evaluation. It is NOT clinician feedback.
+    # ---------------------------------------------------------------
+    agent.model.update(
+        agent.feature_extractor.extract(sample.state).values,
+        sample.label,
     )
 
 
 def _print_progress(
     *,
-    patient_index: int,
-    total_patients: int,
-    observation_count: int,
+    evaluator: OnlineMetricsEvaluator,
+    processed_observations: int,
+    total_observations: int,
     start_time: float,
-    runner: OnlineEvaluationRunner,
 ) -> None:
-    """Print the current evaluation/training state."""
+    """Print lightweight progress information."""
+    elapsed = max(time.perf_counter() - start_time, 1e-9)
 
-    elapsed = time.perf_counter() - start_time
+    observations_per_second = (
+        processed_observations / elapsed
+    )
 
-    if patient_index > 0:
-        rate = patient_index / elapsed if elapsed > 0 else 0.0
+    metrics = evaluator.compute()
 
-        remaining_patients = (
-            total_patients - patient_index
-        )
+    metrics = evaluator.compute()
 
-        eta = (
-            remaining_patients / rate
-            if rate > 0
-            else 0.0
-        )
-    else:
-        rate = 0.0
-        eta = 0.0
+    pr_auc = metrics.pr_auc
+    precision = metrics.precision
+    recall = metrics.recall
+    f1 = metrics.f1
+    mean_loss = metrics.mean_loss
 
-    evaluator = runner.evaluator
-
-    if evaluator.records:
-        metrics = evaluator.compute()
-
-        precision = metrics.precision
-        recall = metrics.recall
-        f1 = metrics.f1
-        log_loss = metrics.mean_loss
-        pr_auc = metrics.pr_auc
-    else:
-        precision = recall = f1 = log_loss = 0.0
-        pr_auc = None
-
-    percentage = (
-        100.0 * patient_index / total_patients
-        if total_patients
+    progress = (
+        processed_observations / total_observations
+        if total_observations > 0
         else 0.0
     )
 
-    pr_auc_text = (
-        f"{pr_auc:.4f}"
-        if pr_auc is not None
-        else "N/A"
+    eta_seconds = (
+        (total_observations - processed_observations)
+        / observations_per_second
+        if observations_per_second > 0
+        else 0.0
     )
 
-    bar = _progress_bar(
-        patient_index,
-        total_patients,
-    )
-
-    message = (
-        f"\r"
-        f"{bar} "
-        f"{percentage:6.2f}% "
-        f"{patient_index:,}/{total_patients:,} patients"
-        f" | observations={observation_count:,}"
-        f" | PR-AUC={pr_auc_text}"
-        f" | P={precision:.3f}"
-        f" | R={recall:.3f}"
-        f" | F1={f1:.3f}"
-        f" | loss={log_loss:.4f}"
-        f" | {rate:.2f} patients/s"
-        f" | ETA={_format_duration(eta)}"
-    )
-
-    sys.stdout.write(message)
-    sys.stdout.flush()
-
-
-def _evaluate_with_progress(
-    *,
-    patient_files: list[Path],
-    runner: OnlineEvaluationRunner,
-    progress_every: int,
-) -> None:
-    """
-    Evaluate patients while displaying online-learning progress.
-
-    The model is updated after every observation. The progress display
-    is updated after every N patients.
-    """
-
-    start_time = time.perf_counter()
-    observation_count = 0
-
-    total_patients = len(patient_files)
-
-    print()
-    print("Starting online evaluation...")
     print(
-        "The model predicts first, then learns from the label "
-        "for every observation."
+        f"[{progress:6.1%}] "
+        f"obs={processed_observations:,}/{total_observations:,} "
+        f"PR-AUC={_format_metric(pr_auc)} "
+        f"P={_format_metric(precision)} "
+        f"R={_format_metric(recall)} "
+        f"F1={_format_metric(f1)} "
+        f"loss={_format_metric(mean_loss)} "
+        f"speed={observations_per_second:,.1f}/s "
+        f"ETA={eta_seconds / 60.0:.1f}m"
     )
-    print()
 
-    for patient_index, psv_path in enumerate(
-        patient_files,
-        start=1,
-    ):
-        stream = PSVEvaluationStream(psv_path)
 
-        before = len(runner.evaluator.records)
+def _format_metric(value: object) -> str:
+    """Format a metric safely for console output."""
+    if value is None:
+        return "N/A"
 
-        runner.evaluate(
-            stream.samples()
-        )
+    try:
+        return f"{float(value):.4f}"
+    except (TypeError, ValueError):
+        return str(value)
 
-        after = len(runner.evaluator.records)
 
-        observation_count += after - before
+def _count_observations(
+    psv_files: list[Path],
+) -> int:
+    """Count non-empty data rows across the selected PSV files."""
+    total = 0
 
-        should_update = (
-            patient_index % progress_every == 0
-            or patient_index == total_patients
-        )
+    for path in psv_files:
+        with path.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            # Skip header.
+            next(file, None)
 
-        if should_update:
-            _print_progress(
-                patient_index=patient_index,
-                total_patients=total_patients,
-                observation_count=observation_count,
-                start_time=start_time,
-                runner=runner,
+            total += sum(
+                1
+                for line in file
+                if line.strip()
             )
 
-    elapsed = time.perf_counter() - start_time
+    return total
 
-    print()
-    print()
-    print(
-        f"Evaluation completed in "
-        f"{_format_duration(elapsed)}."
+
+def _save_predictions(
+    *,
+    output_path: Path,
+    evaluator: OnlineMetricsEvaluator,
+) -> None:
+    """Write prediction records to JSONL."""
+    predictions_path = output_path / "predictions.jsonl"
+
+    with predictions_path.open(
+        "w",
+        encoding="utf-8",
+    ) as file:
+        for record in evaluator.records:
+            file.write(
+                json.dumps(
+                    {
+                        "patient_id": record.patient_id,
+                        "timestamp": record.timestamp,
+                        "probability": record.probability,
+                        "predicted_label": record.predicted_label,
+                        "true_label": record.true_label,
+                        "loss": record.loss,
+                        "model_version": record.model_version,
+                    }
+                )
+                + "\n"
+            )
+
+
+def _save_results(
+    *,
+    output_path: Path,
+    evaluator: OnlineMetricsEvaluator,
+    args: argparse.Namespace,
+) -> None:
+    """Save metrics and experiment configuration."""
+    output_path.mkdir(
+        parents=True,
+        exist_ok=True,
     )
+
+    metrics = evaluator.compute()
+
+    with (
+        output_path / "metrics.json"
+    ).open(
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            metrics.as_dict(),
+            file,
+            indent=2,
+        )
+
+    _save_predictions(
+        output_path=output_path,
+        evaluator=evaluator,
+    )
+
+    config = {
+        "input": str(args.input),
+        "history_window": args.history_window,
+        "learning_rate": args.learning_rate,
+        "l2": args.l2,
+        "positive_class_weight": args.positive_class_weight,
+        "gradient_clip": args.gradient_clip,
+        "threshold": args.threshold,
+        "diminishing_learning_rate": (
+            not args.constant_learning_rate
+        ),
+        "max_forward_fill": args.max_forward_fill,
+        "max_patients": args.max_patients,
+    }
+
+    with (
+        output_path / "config.json"
+    ).open(
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            config,
+            file,
+            indent=2,
+        )
 
 
 def main() -> None:
     args = parse_args()
 
-    if args.progress_every <= 0:
-        raise ValueError(
-            "--progress-every must be greater than zero"
-        )
+    _validate_args(args)
 
-    patient_files = discover_psv_files(args.input)
+    input_path = Path(args.input)
+    output_path = Path(args.output)
+
+    psv_files = discover_psv_files(
+        input_path,
+    )
 
     if args.max_patients is not None:
-        patient_files = patient_files[:args.max_patients]
+        psv_files = psv_files[
+            : args.max_patients
+        ]
 
-    args.output.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    agent = build_agent(args)
-
-    write_run_metadata(
-        args.output,
-        args=args,
-        patient_files=patient_files,
-        agent=agent,
-    )
-
-    runner = OnlineEvaluationRunner(agent)
-
-    print("=" * 80)
-    print("ONLINE LOGISTIC REGRESSION EVALUATION")
-    print("=" * 80)
-    print(f"Input          : {args.input}")
-    print(f"Patients       : {len(patient_files):,}")
-    print(f"Output         : {args.output}")
-    print(f"Features       : {agent.feature_extractor.n_features}")
-    print(f"Learning rate  : {args.learning_rate}")
-    print(f"Positive weight: {args.positive_class_weight}")
-    print(f"Threshold      : {args.threshold}")
-    print()
-
-    _evaluate_with_progress(
-        patient_files=patient_files,
-        runner=runner,
-        progress_every=args.progress_every,
-    )
-
-    artifacts = runner.save_results(
-        args.output,
-    )
-
-    metrics = runner.evaluator.compute()
-
-    print()
-    print("=" * 80)
-    print("FINAL RESULTS")
-    print("=" * 80)
-
-    print(f"Observations   : {metrics.sample_count:,}")
-    print(f"Positive       : {metrics.positive_count:,}")
-    print(f"Negative       : {metrics.negative_count:,}")
-    print()
-
-    print(f"Accuracy       : {metrics.accuracy:.4f}")
-    print(
-        f"Balanced Acc.  : "
-        f"{metrics.balanced_accuracy:.4f}"
-    )
-    print(f"Precision      : {metrics.precision:.4f}")
-    print(f"Recall         : {metrics.recall:.4f}")
-    print(f"Specificity    : {metrics.specificity:.4f}")
-    print(f"F1             : {metrics.f1:.4f}")
-
-    if metrics.roc_auc is not None:
-        print(f"ROC-AUC        : {metrics.roc_auc:.4f}")
-    else:
-        print("ROC-AUC        : N/A")
-
-    if metrics.pr_auc is not None:
-        print(f"PR-AUC         : {metrics.pr_auc:.4f}")
-    else:
-        print("PR-AUC         : N/A")
-
-    print(f"Brier Score    : {metrics.brier_score:.4f}")
-    print(f"Log Loss       : {metrics.log_loss:.4f}")
-    print(
-        "Calibration ECE: "
-        f"{metrics.expected_calibration_error:.4f}"
-    )
-    print(f"Mean Loss      : {metrics.mean_loss:.4f}")
-
-    if metrics.alerts_per_patient_hour is not None:
-        print(
-            "Alerts/hour    : "
-            f"{metrics.alerts_per_patient_hour:.4f}"
+    if not psv_files:
+        raise ValueError(
+            "No PSV files selected for evaluation."
         )
-    else:
-        print("Alerts/hour    : N/A")
 
-    print()
-    print("Confusion Matrix")
-    print(
-        f"  TN={metrics.confusion_matrix.true_negative:,} "
-        f"FP={metrics.confusion_matrix.false_positive:,}"
-    )
-    print(
-        f"  FN={metrics.confusion_matrix.false_negative:,} "
-        f"TP={metrics.confusion_matrix.true_positive:,}"
+    total_observations = _count_observations(
+        psv_files,
     )
 
-    print()
-    print("Artifacts")
-    for name, path in artifacts.items():
-        print(f"  {name:18s}: {path}")
+    agent = _create_agent(args)
+
+    evaluator = OnlineMetricsEvaluator()
+
+    processed_observations = 0
+    start_time = time.perf_counter()
 
     print()
+    print("=" * 72)
+    print("Online Logistic Regression Evaluation")
+    print("=" * 72)
+    print(f"Input              : {input_path}")
+    print(f"Patients           : {len(psv_files):,}")
+    print(f"Observations       : {total_observations:,}")
+    print(f"History window     : {args.history_window}")
+    print(f"Learning rate      : {args.learning_rate}")
+    print(f"L2                 : {args.l2}")
+    print(f"Positive weight    : {args.positive_class_weight}")
+    print(f"Threshold          : {args.threshold}")
+    print(
+        "Learning rate mode : "
+        + (
+            "diminishing"
+            if not args.constant_learning_rate
+            else "constant"
+        )
+    )
+    print("=" * 72)
+    print()
+
+    for patient_index, psv_file in enumerate(
+        psv_files,
+        start=1,
+    ):
+        _, processed_observations = _evaluate_patient(
+            psv_file=psv_file,
+            agent=agent,
+            evaluator=evaluator,
+            history_window=args.history_window,
+            max_forward_fill=args.max_forward_fill,
+            progress_every=args.progress_every,
+            processed_observations=processed_observations,
+            total_observations=total_observations,
+            start_time=start_time,
+        )
+
+        if patient_index % max(
+            1,
+            min(100, len(psv_files)),
+        ) == 0:
+            print(
+                f"Patients processed: "
+                f"{patient_index:,}/{len(psv_files):,}"
+            )
+
+    elapsed = time.perf_counter() - start_time
+
+    _save_results(
+        output_path=output_path,
+        evaluator=evaluator,
+        args=args,
+    )
+
+    metrics = evaluator.compute()
+
+    print()
+    print("=" * 72)
+    print("Final Results")
+    print("=" * 72)
+
+    print(
+        f"Observations   : "
+        f"{len(evaluator.records):,}"
+    )
+
+    print(
+        f"Positive       : "
+        f"{sum(r.true_label for r in evaluator.records):,}"
+    )
+
+    print(
+        f"Negative       : "
+        f"{sum(1 - r.true_label for r in evaluator.records):,}"
+    )
+
+    for name in (
+        "accuracy",
+        "balanced_accuracy",
+        "precision",
+        "recall",
+        "specificity",
+        "negative_predictive_value",
+        "f1",
+        "roc_auc",
+        "pr_auc",
+        "brier_score",
+        "log_loss",
+        "expected_calibration_error",
+        "alerts_per_patient_hour",
+    ):
+        value = getattr(metrics, name)
+
+        print(
+            f"{name.replace('_', ' ').title():<28}: "
+            f"{_format_metric(value)}"
+        )
+
+    print(
+        f"Runtime          : "
+        f"{elapsed / 60.0:.2f} minutes"
+    )
+
+    print(
+        f"Output            : "
+        f"{output_path}"
+    )
+
+    print("=" * 72)
 
 
 if __name__ == "__main__":

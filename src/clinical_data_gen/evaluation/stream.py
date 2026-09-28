@@ -1,22 +1,19 @@
-"""Adapters for converting ingested PSV rows into evaluation streams."""
+"""Streaming evaluation utilities for PSV data."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterator
 
-from clinical_data_gen.evaluation.runner import OnlineEvaluationRunner
 from clinical_data_gen.ingestion.psv_ingestor import PSVIngestor
+from clinical_data_gen.state.patient_state_manager import PatientStateManager
 from clinical_data_gen.state.patient_state import PatientState
-from clinical_data_gen.state.patient_state_manager import (
-    PatientStateManager,
-)
 
 
 @dataclass(frozen=True)
 class EvaluationSample:
-    """One labelled observation for online evaluation."""
+    """One state/ground-truth pair from the evaluation stream."""
 
     state: PatientState
     label: int
@@ -24,150 +21,170 @@ class EvaluationSample:
 
 class PSVEvaluationStream:
     """
-    Convert a PSV file into an ordered PatientState/label stream.
+    Convert PSV files into an ordered stream of PatientState observations.
 
-    SepsisLabel is used here strictly as the offline evaluation target.
-    It is not stored inside PatientState and is not treated as
-    clinician feedback.
+    The state manager retains enough previous observations for the configured
+    feature-extraction history window.
     """
 
     def __init__(
         self,
-        psv_path: str | Path,
         *,
-        patient_id: str | None = None,
+        history_window: int = 6,
+        max_forward_fill: int = 3,
     ) -> None:
-        self.psv_path = Path(psv_path)
-        self.patient_id = patient_id or self.psv_path.stem
+        if history_window < 1:
+            raise ValueError("history_window must be at least 1")
 
-    def samples(self) -> Iterator[tuple[PatientState, int]]:
-        """
-        Yield PatientState and SepsisLabel pairs in PSV order.
-        """
+        if max_forward_fill < 0:
+            raise ValueError("max_forward_fill must be non-negative")
 
-        state_manager = PatientStateManager()
+        self.history_window = history_window
+        self.max_forward_fill = max_forward_fill
+
+    def samples(
+        self,
+        psv_path: str | Path,
+    ) -> Iterator[EvaluationSample]:
+        """
+        Yield PatientState objects and their PSV SepsisLabel values.
+
+        The label is evaluation-only ground truth. It is not stored inside
+        PatientState.
+        """
+        state_manager = PatientStateManager(
+            history_length=self.history_window,
+            max_forward_fill=self.max_forward_fill,
+        )
+
         ingestor = PSVIngestor(state_manager)
 
-        rows = self._read_rows()
-
-        for row in rows:
+        for patient_id, row in self._iter_psv_rows(psv_path):
             state, label = ingestor.ingest_row(
-                patient_id=self.patient_id,
+                patient_id=patient_id,
                 row=row,
             )
 
-            yield state, int(label)
+            yield EvaluationSample(
+                state=state,
+                label=int(label),
+            )
 
-    def _read_rows(self) -> Iterator[dict[str, str | None]]:
+    def _iter_psv_rows(
+        self,
+        psv_path: str | Path,
+    ):
         """
-        Read the PSV file while preserving the existing ingestion contract.
+        Read a PSV file and yield patient ID + parsed raw row.
 
-        The PSV ingestor remains responsible for schema validation and
-        clinical-value parsing.
+        Patient ID is derived from the file name, matching the existing
+        evaluation convention.
         """
+        path = Path(psv_path)
 
-        with self.psv_path.open(
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"PSV file not found: {path}"
+            )
+
+        patient_id = path.stem
+
+        with path.open(
             "r",
             encoding="utf-8",
         ) as file:
             header_line = file.readline().strip()
 
             if not header_line:
-                raise ValueError(
-                    f"Empty PSV file: {self.psv_path}"
-                )
+                return
 
-            columns = header_line.split("|")
+            headers = header_line.split("|")
 
-            for line_number, line in enumerate(
-                file,
-                start=2,
-            ):
-                line = line.rstrip("\n\r")
+            for line in file:
+                line = line.strip()
 
                 if not line:
                     continue
 
                 values = line.split("|")
 
-                if len(values) != len(columns):
+                if len(values) != len(headers):
                     raise ValueError(
-                        f"Malformed PSV row at line "
-                        f"{line_number}: expected "
-                        f"{len(columns)} columns, got "
-                        f"{len(values)}"
+                        f"Invalid PSV row in {path}: "
+                        f"expected {len(headers)} columns, "
+                        f"got {len(values)}"
                     )
 
-                yield {
-                    column: (
-                        value
-                        if value != ""
-                        else None
-                    )
-                    for column, value in zip(
-                        columns,
-                        values,
-                    )
-                }
+                yield patient_id, dict(
+                    zip(headers, values)
+                )
 
 
 def evaluate_psv_file(
     psv_path: str | Path,
-    runner: OnlineEvaluationRunner,
-) -> None:
+    *,
+    history_window: int = 6,
+    max_forward_fill: int = 3,
+) -> Iterator[EvaluationSample]:
     """
-    Evaluate one PSV patient stream using an existing runner.
+    Evaluate one PSV file as an ordered state stream.
     """
-
-    stream = PSVEvaluationStream(psv_path)
-
-    runner.evaluate(
-        stream.samples()
+    stream = PSVEvaluationStream(
+        history_window=history_window,
+        max_forward_fill=max_forward_fill,
     )
+
+    yield from stream.samples(psv_path)
 
 
 def evaluate_psv_files(
-    psv_paths: Iterable[str | Path],
-    runner: OnlineEvaluationRunner,
-) -> None:
+    psv_files: list[str | Path],
+    *,
+    history_window: int = 6,
+    max_forward_fill: int = 3,
+) -> Iterator[EvaluationSample]:
     """
-    Evaluate multiple patient PSV files sequentially.
+    Evaluate multiple PSV files sequentially.
 
-    Model state is intentionally preserved between patients, allowing
-    the online learner to learn continuously from the stream.
+    Each patient receives its own PatientStateManager, so history does not
+    leak between patients.
     """
-
-    for psv_path in psv_paths:
-        evaluate_psv_file(
-            psv_path,
-            runner,
+    for psv_file in psv_files:
+        yield from evaluate_psv_file(
+            psv_file,
+            history_window=history_window,
+            max_forward_fill=max_forward_fill,
         )
+
 
 def discover_psv_files(
     input_path: str | Path,
 ) -> list[Path]:
-    """Find PSV files from a file or directory."""
+    """
+    Discover PSV files from either a single file or a directory.
+    """
+    path = Path(input_path)
 
-    input_path = Path(input_path)
-
-    if input_path.is_file():
-        if input_path.suffix.lower() != ".psv":
+    if path.is_file():
+        if path.suffix.lower() != ".psv":
             raise ValueError(
-                f"Input file is not a PSV file: {input_path}"
+                f"Expected a .psv file: {path}"
             )
 
-        return [input_path]
+        return [path]
 
-    if not input_path.is_dir():
-        raise FileNotFoundError(
-            f"Input path does not exist: {input_path}"
+    if path.is_dir():
+        files = sorted(
+            path.glob("*.psv")
         )
 
-    files = sorted(input_path.glob("*.psv"))
+        if not files:
+            raise FileNotFoundError(
+                f"No .psv files found in: {path}"
+            )
 
-    if not files:
-        raise FileNotFoundError(
-            f"No .psv files found in {input_path}"
-        )
+        return files
 
-    return files
+    raise FileNotFoundError(
+        f"Input path not found: {path}"
+    )
