@@ -34,3 +34,7 @@ Thumbs.db
 
 # Logs and local output
 *.log
+
+
+# Evaluation outputs
+data/evaluation/
