@@ -1,0 +1,42 @@
+{
+  "scope": "Generated synthetic cohort; observed-data-only alert policy; patient-level episode evaluation",
+  "episodes": 33,
+  "detected_episodes": 19,
+  "alert_events": 66,
+  "alert_episodes": 57,
+  "matched_alert_episodes": 21,
+  "false_alert_episodes": 36,
+  "false_alert_events": 41,
+  "episode_precision": 0.3684,
+  "episode_recall": 0.5758,
+  "median_lead_time_minutes": 29.0,
+  "alerts_per_patient_hour": 0.3687,
+  "duplicate_suppression_rate": 0.9143,
+  "artifact_false_positive_rate": 0.0,
+  "artifact_alerts": 0,
+  "artifact_observations": 3,
+  "rag_citation_coverage": 0.0,
+  "audit_record_completeness": 1.0,
+  "audit_records_evaluated": 10800,
+  "alert_policy": {
+    "minimum_persistent_flags": 2,
+    "persistence_window_readings": 3,
+    "requires_cross_system_evidence": true,
+    "cooldown_minutes": 30,
+    "relative_thresholds": {
+      "heart_rate_delta": 18,
+      "spo2_drop": 3,
+      "respiratory_rate_delta": 5,
+      "respiratory_rate_low_drop": 5,
+      "systolic_pressure_drop": 20
+    },
+    "uses_ground_truth": false
+  },
+  "definitions": {
+    "episode_match": "At least one alert between labelled onset and escalation-window start, inclusive.",
+    "precision": "Alert episodes (alerts for one patient within a 30-minute interval are clustered) that overlap a labelled onset-to-escalation interval divided by all alert episodes.",
+    "recall": "Episodes with an alert in the matching window divided by all labelled positive episodes.",
+    "duplicate_suppression": "Confirmed trigger candidates suppressed by cooldown divided by candidates either suppressed or raised.",
+    "artifact_false_positive": "Artifact-labelled observations receiving an alert divided by all artifact-labelled observations."
+  }
+}
