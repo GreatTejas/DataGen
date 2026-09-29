@@ -4,11 +4,14 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timezone
 import math
+import os
 from statistics import mean
 from typing import Any, Mapping, Sequence
+from pathlib import Path
 
 from clinical_data_gen.anomaly import AnomalyAgent, AnomalyFeedback
-from clinical_data_gen.clinical_reasoning import ClinicalReasoningPlaceholder
+from clinical_reasoning.adapters import ExperienceMemoryAdapter, evidence_from_p3
+from clinical_reasoning.pipeline import P4Service
 from clinical_data_gen.state import PatientState, PatientStateManager
 from clinical_data_gen.trend import TrendResult
 from experience import ExperienceMemory, HistoricalCase
@@ -50,7 +53,19 @@ class DeteriorationWorkflow:
         self.risk_assessor = RiskAssessor()
         self.experience_memory = ExperienceMemory()
         self.evidence_fusion = EvidenceFusion()
-        self.clinical_reasoning = ClinicalReasoningPlaceholder()
+        repository_root = Path(__file__).resolve().parents[2]
+        self.clinical_reasoning = P4Service(
+            repository_root / "knowledge" / "protocol_corpus.jsonl",
+            live_llm=os.environ.get("P4_LIVE_LLM", "").strip().lower() == "true",
+            experience_client=ExperienceMemoryAdapter(self.experience_memory),
+            retrieval_backend=os.environ.get("P4_RETRIEVAL_BACKEND", "tfidf").strip().lower(),
+            index_path=repository_root / "data" / "derived" / "p4_vector_index.sqlite3",
+            embedding_model=os.environ.get(
+                "P4_EMBEDDING_MODEL",
+                "sentence-transformers/all-MiniLM-L6-v2",
+            ),
+            model=os.environ.get("P4_MODEL"),
+        )
         self.baseline_window = baseline_window
         self.contexts: dict[str, dict[str, Any]] = {}
         self.results: dict[str, dict[str, Any]] = {}
@@ -136,7 +151,24 @@ class DeteriorationWorkflow:
             risk_result,
             experience_result,
         )
-        reasoning = self.clinical_reasoning.run(fused)
+        p4_evidence = evidence_from_p3(
+            evidence_id=event_id,
+            patient_id=patient_id,
+            window_end=timestamp.isoformat(),
+            current_vitals=observed_vitals,
+            trend_result=trend_output,
+            anomaly_result={
+                "probability": anomaly_result.probability,
+                "is_anomalous": anomaly_result.is_anomalous,
+                "contributing_features": list(anomaly_result.contributing_features),
+                "model_version": anomaly_result.model_version,
+            },
+            risk_result=risk_result,
+            patient_context_payload=context,
+            experience_result=experience_result,
+            fusion_confidence=fused.final_confidence,
+        )
+        reasoning = self.clinical_reasoning.reason(p4_evidence).to_dict()
 
         case = HistoricalCase(
             case_id=event_id,
@@ -172,7 +204,7 @@ class DeteriorationWorkflow:
                 "final_confidence": fused.final_confidence,
                 "evidence_summary": list(fused.evidence_summary),
             },
-            "clinical_reasoning": reasoning.to_dict(),
+            "clinical_reasoning": reasoning,
         }
         self.results[event_id] = output
         self._states_by_event[event_id] = deepcopy(state)

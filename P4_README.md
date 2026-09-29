@@ -28,7 +28,7 @@ python scripts/run_p4_demo.py --retrieval dense
 Groq inference is optional. Create an API key in Groq Console, then set it in the current PowerShell session; do not put it in source files:
 
 ```powershell
-$env:GROQ_API_KEY = "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" #generated for test
+# Supply GROQ_API_KEY through a secret manager or process environment.
 python scripts/run_p4_demo.py --retrieval dense --groq
 ```
 

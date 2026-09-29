@@ -76,6 +76,10 @@ def calculate_metrics(
     suppressed = sum(d["policy"] == "SUPPRESS" and ("cooldown" in d["policy_reason"].lower() or "duplicate alert" in d["policy_reason"].lower()) for d in trigger_attempts)
     raised_attempts = sum(d["policy"] == "ALERT" for d in trigger_attempts)
     suppression_rate = suppressed / (suppressed + raised_attempts) if suppressed + raised_attempts else 0.0
+    alert_traces = [row for row in (audit_records or [])
+                    if (row.get("alert") or {}).get("decision") == "ALERT"]
+    cited_alerts = sum(bool(row.get("citations")) for row in alert_traces)
+    citation_coverage = cited_alerts / len(alert_traces) if alert_traces else 0.0
     artifact_event_ids = {event_id for event_id, label in labels.items() if label.get("artifact_injected")}
     artifact_alerts = sum(1 for event_id in artifact_event_ids if event_decisions.get(event_id, {}).get("policy") == "ALERT")
     artifact_fpr = artifact_alerts / len(artifact_event_ids) if artifact_event_ids else None
@@ -94,7 +98,7 @@ def calculate_metrics(
         "duplicate_suppression_rate": round(suppression_rate, 4),
         "artifact_false_positive_rate": round(artifact_fpr, 4) if artifact_fpr is not None else None,
         "artifact_alerts": artifact_alerts, "artifact_observations": len(artifact_event_ids),
-        "rag_citation_coverage": 0.0,
+        "rag_citation_coverage": round(citation_coverage, 4),
         "audit_record_completeness": round(complete / len(trace), 4) if trace else 0.0,
         "audit_records_evaluated": len(trace),
         "alert_policy": {"minimum_persistent_flags": 2, "persistence_window_readings": 3, "requires_cross_system_evidence": True, "cooldown_minutes": 30,
@@ -106,6 +110,7 @@ def calculate_metrics(
             "recall": "Episodes with an alert in the matching window divided by all labelled positive episodes.",
             "duplicate_suppression": "Confirmed trigger candidates suppressed by cooldown divided by candidates either suppressed or raised.",
             "artifact_false_positive": "Artifact-labelled observations receiving an alert divided by all artifact-labelled observations.",
+            "rag_citation_coverage": "Alert policy evaluations with at least one retrieved protocol citation divided by audited alert evaluations.",
         },
     }
     return metrics, prediction_rows

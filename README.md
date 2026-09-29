@@ -36,8 +36,8 @@ flowchart LR
     P1 --> P2[P2 State + Anomaly + Learning]
     P2 --> P3[P3 Risk + Evidence Fusion + Experience]
     P3 --> HANDOFF[patient.evidence]
-    HANDOFF -. P4 consumer pending .-> P4[P4 RAG + Clinical Reasoning pending]
-    P4 -. future integration .-> P5[P5 Alert Policy + Review UI]
+    HANDOFF --> P4[P4 local RAG + Clinical Reasoning]
+    P4 --> P5[P5 Alert Policy + Review UI]
     P5 --> AUDIT[Audit + clinician feedback]
     AUDIT -. feedback .-> P2
     FILES[Generated mock cohort] -. local demo input .-> P5
@@ -49,7 +49,7 @@ flowchart LR
 | --- | --- | --- | --- |
 | Vital readings | `vitals.raw` | `patient_id` | Ordered, event-time patient telemetry |
 | Static context | `patient.context` | `patient_id` | Compacted profile available before replay |
-| Consolidated observed evidence | `patient.evidence` | `patient_id` | P1-P3 output; explicit P4-pending handoff |
+| Consolidated observed evidence | `patient.evidence` | `patient_id` | P1-P4 evidence, citations, and structured reasoning |
 | Invalid input | `vitals.dlq` | `patient_id` | Rejected JSON, schema, or quality events |
 | Ground truth | `evaluation.ground_truth` | `episode_id` | Held-out labels for measuring detection and alert burden |
 | Knowledge documents | RAG corpus | `document_id` | Versioned, citeable guideline snippets |
@@ -80,7 +80,7 @@ python -m clinical_data_gen.cli generate --output data/generated --patients 60 -
 python -m clinical_data_gen.cli validate --input data/generated
 ```
 
-The Kafka consumer validates context and vitals, runs the shared P1-P3 workflow, and publishes consolidated observed evidence to `patient.evidence`. Start it in one terminal, then replay the generated cohort in another:
+The Kafka consumer validates context and vitals, runs the shared P1-P4 workflow, and publishes consolidated observed evidence, citations, and reasoning to `patient.evidence`. It uses local TF-IDF retrieval and deterministic reasoning by default; no external LLM call or dense-embedding download is needed. Start it in one terminal, then replay the generated cohort in another:
 
 ```powershell
 $env:KAFKA_BROKER = "localhost:9092"
@@ -91,7 +91,9 @@ python -m ingestion.consumer
 python -m ingestion.producer --input data/generated/vitals_observed.jsonl --speed 60
 ```
 
-The producer publishes `patient.context` before time-ordered `vitals.raw` readings; `--speed 60` sends one minute of simulated time per real second. The CLI file replay remains available for stdout-only inspection: `python -m clinical_data_gen.cli replay --input data/generated --speed 60`. The P5 dashboard reads the generated mock cohort locally; it does not yet consume Kafka output. P4 RAG retrieval and clinical reasoning are placeholders in both handoffs.
+The producer publishes `patient.context` before time-ordered `vitals.raw` readings; `--speed 60` sends one minute of simulated time per real second. The CLI file replay remains available for stdout-only inspection: `python -m clinical_data_gen.cli replay --input data/generated --speed 60`. The P5 dashboard also processes the generated mock cohort locally through P1-P4; it does not yet consume Kafka output.
+
+Optional dense local retrieval can be enabled with `P4_RETRIEVAL_BACKEND=dense` after installing `python -m pip install -e ".[p4-local]"`; the embedding model is fetched on first use. To explicitly opt into Groq tool-calling, install `python -m pip install -e ".[p4-groq]"`, set `GROQ_API_KEY` in the process environment, then set `P4_LIVE_LLM=true`. Groq receives the supplied evidence, so only use synthetic data and never transmit patient identifiers or protected health information.
 
 ## Outputs
 
@@ -116,9 +118,9 @@ The live payload intentionally excludes `scenario`, `risk_label`, `latent`, `tre
 
 Baselines, serial-dependence diagnostics, residual correlation, and sepsis-onset templates are fitted from the local PhysioNet Challenge 2019 training data. The generator consumes fitted baselines, real sepsis templates, and fitted correlated AR(1) residual noise. CDC NHANES 2017-2018 adds an independent community HR/BP baseline reference for hard-negative comparison; it is not used as a deterioration-trajectory source. Medication effects are intentionally not fitted or applied: Challenge-2019 has no medication history or administration field. The additional discriminating archetypes are mechanism-based stress tests, not claims of clinical validation.
 
-### P4 status: RAG grounding pending
+### P4 status: RAG and reasoning integrated
 
-The repository includes a versioned protocol-corpus seed with document IDs, source URLs, versions, and locators. It is not yet chunked, embedded, indexed, or retrieved by a RAG service. The current P4 interface explicitly returns `not_implemented` and empty evidence/citation fields; it must not be described as providing clinical explanations or recommendations.
+The P4 service chunks the versioned protocol corpus and supports local TF-IDF or persistent dense-vector retrieval. Its offline deterministic reasoner consumes consolidated P3 evidence and reviewed similar cases, returning a structured explanation, cautious clinician-review action, contributing factors, confidence, and passage-grounded citations. Groq tool-calling is optional and disabled unless explicitly enabled. These prototype outputs are not clinical advice or clinical validation.
 
 ## Evaluation that makes the demo credible
 
@@ -141,9 +143,13 @@ src/clinical_data_gen/
   fit_physionet.py   # fit PhysioNet parameters and real sepsis templates
   fit_nhanes.py      # fit independent CDC NHANES HR/BP community baselines
   schema.py          # explicit event envelopes and schema version
-  pipeline.py        # stateful P1-P3 workflow and P4 handoff
-  clinical_reasoning.py # explicit P4 placeholder
+  pipeline.py        # stateful P1-P4 workflow
   cli.py             # generate, validate, replay commands
+src/clinical_reasoning/
+  adapters.py        # P3-to-P4 evidence and experience-memory adapters
+  knowledge_store.py # corpus chunking and local retrieval
+  reasoning_agent.py # deterministic and optional Groq reasoning
+  pipeline.py        # P4 service boundary
 src/ingestion/
   producer.py        # context-first event-time Kafka replay
   consumer.py        # validation, P1-P3 execution, evidence handoff, DLQ
@@ -158,7 +164,7 @@ tests/                # deterministic and safety/invariant tests
 1. Generate a fixed-seed cohort and show `data_quality_report.json`.
 2. Publish contexts, then replay observations into `vitals.raw`.
 3. Show an artifact that should be suppressed, then a labelled multi-parameter episode.
-4. Show the P4-pending handoff (no retrieved evidence, citations, or recommendation) rather than claiming RAG or clinical reasoning is implemented.
+4. Inspect the P4 explanation, clinician-review action, and protocol citations; distinguish deterministic local reasoning from optional Groq output.
 5. Use the local P5 review UI to inspect the generated cohort, record clinician actions, and compare policy decisions with the held-out episode window.
 
 ## Governance
@@ -167,4 +173,4 @@ Do not use real patient identifiers. Generated IDs are synthetic. Preserve the m
 
 ## Person 4 integration
 
-Person 4's local RAG and clinical reasoning setup is documented in [P4_README.md](P4_README.md). Local embeddings and the persistent vector index run on this machine; optional Groq reasoning requires a `GROQ_API_KEY` and sends the evidence to Groq Cloud.
+Person 4's RAG and clinical reasoning setup is documented in [P4_README.md](P4_README.md). TF-IDF and deterministic reasoning run locally by default; dense local embeddings and the persistent vector index are optional. Groq reasoning requires explicit opt-in and sends evidence to Groq Cloud.

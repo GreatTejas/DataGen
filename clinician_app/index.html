@@ -15,9 +15,9 @@
   </style>
 </head>
 <body>
-  <header><div class="brand">CareSignal <small>/ Clinician review</small></div><span id="mode" class="mode">Integrated demo · P4 pending</span></header>
+  <header><div class="brand">CareSignal <small>/ Clinician review</small></div><span id="mode" class="mode">Integrated demo · P4 active</span></header>
   <main>
-    <div class="intro"><div><h1>Patient review queue</h1><p>Observed data flows through P1–P3 into P5; P4 is intentionally pending.</p></div><button class="button" id="refresh">Refresh data</button></div>
+    <div class="intro"><div><h1>Patient review queue</h1><p>Observed data flows through P1–P4 into the P5 review and alert-policy workflow.</p></div><button class="button" id="refresh">Refresh data</button></div>
     <div class="notice">Synthetic demonstration only. Not clinically validated and not for patient care. Follow current local clinical protocols.</div>
     <div class="layout">
       <section class="panel"><div class="panel-title"><span>Patients</span><span id="count" class="muted"></span></div><div class="patient-search"><input id="search" placeholder="Search patient ID"></div><div id="patients" class="patient-list"></div></section>
@@ -29,10 +29,11 @@
     let dashboardData={cases:[]},selectedPatient=null;
     const escapeHtml=value=>String(value??"").replace(/[&<>"']/g,char=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
     const number=(value,digits=1)=>Number.isFinite(Number(value))?Number(value).toFixed(digits):"—";
+    const safeLink=value=>{try{const url=new URL(value);return url.protocol==="https:"?url.href:""}catch{return""}};
     async function load(){
       const response=await fetch("/api/dashboard");
       dashboardData=await response.json();
-      document.getElementById("mode").textContent=dashboardData.mode||"Integrated demo · P4 pending";
+      document.getElementById("mode").textContent=dashboardData.mode||"Integrated demo · P4 active";
       renderPatients();renderAudit();
       const current=dashboardData.cases.find(item=>item.patient_id===selectedPatient)||dashboardData.cases[0];
       selectedPatient=current?.patient_id||null;
@@ -56,6 +57,9 @@
       const factors=(item.factors||[]).map(value=>`<div class="factor">• ${escapeHtml(value)}</div>`).join("");
       const history=(item.context?.relevant_history||[]).filter(value=>value!=="none recorded").join(", ")||"No history recorded";
       const medications=(item.context?.current_medications||[]).filter(value=>value!=="none recorded").join(", ")||"None recorded";
+      const citations=(reasoning.citations||[]).map(citation=>{const href=safeLink(citation.source_url);return `<div class="factor"><b>${escapeHtml(citation.document_id)} · ${escapeHtml(citation.version)}</b> — ${escapeHtml(citation.locator)}${Number.isFinite(Number(citation.score))?` · score ${number(citation.score,3)}`:""}${href?` · <a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">source</a>`:""}<div class="muted">${escapeHtml(citation.chunk_text||"")}</div></div>`}).join("");
+      const similarCases=(reasoning.similar_cases_referenced||[]).map(caseId=>escapeHtml(caseId)).join(", ")||"No reviewed similar cases referenced";
+      const reasoningFactors=(reasoning.contributing_factors||[]).map(factor=>`<div class="factor">${escapeHtml(factor)}</div>`).join("");
       document.getElementById("detail").innerHTML=`
         <div class="detail-head"><div><h2>${escapeHtml(item.patient_id)}</h2><div class="muted">${escapeHtml(item.context?.age??"—")} years · ${escapeHtml(item.context?.sex||"")} · ${escapeHtml(item.quality)} signal quality</div></div><div class="muted">Latest observation<br><b>${escapeHtml(item.event_time.replace("T"," ").slice(0,16))}</b></div></div>
         <div class="detail-content">
@@ -71,7 +75,7 @@
             <div class="agent"><strong>P3 · Evidence fusion</strong><p>Final confidence ${number(fusion.final_confidence*100,1)}% · ${escapeHtml(fusion.risk_level||"LOW")} risk</p><p>${escapeHtml((fusion.evidence_summary||[]).join(" · "))}</p></div>
           </div></section>
           <section class="section"><h3>P5 · Alert policy evidence</h3><div class="agent"><p><b>${escapeHtml(item.policy)} · ${escapeHtml(item.priority)} priority</b></p><p>${escapeHtml(item.policy_reason)}</p>${factors}</div></section>
-          <section class="section"><h3>P4 · Clinical knowledge and reasoning</h3><div class="p4"><b>${escapeHtml(reasoning.status||"not_implemented")}</b><p>${escapeHtml(reasoning.message||"P4 RAG retrieval and clinical reasoning have not been connected.")}</p><p>No retrieved evidence, citations, diagnosis, or treatment recommendation is produced.</p></div></section>
+          <section class="section"><h3>P4 · Clinical knowledge and reasoning</h3><div class="p4"><b>${escapeHtml(reasoning.model||"P4 unavailable")} · confidence ${number(reasoning.confidence*100,1)}%</b><p>${escapeHtml(reasoning.explanation||"P4 explanation is unavailable.")}</p><p><b>Contributing factors</b></p>${reasoningFactors||'<div class="factor">No additional factors identified.</div>'}<p><b>Suggested action for clinician review</b></p><p>${escapeHtml(reasoning.recommended_action||"No recommendation available.")}</p><p><b>Retrieved protocol citations</b></p>${citations||'<div class="factor">No matching protocol passages were retrieved.</div>'}<p><b>Similar cases:</b> ${similarCases}</p><p>${escapeHtml(reasoning.disclaimer||"Decision support only; not a diagnosis or treatment order.")}</p></div></section>
         </div>
         <div class="actions"><b>Clinician decision</b><div class="muted">${item.last_action?`Last decision: ${escapeHtml(item.last_action.action)}`:"Your action and optional reason are recorded for review."}</div><div class="action-buttons"><button class="button" data-action="Accept">Accept</button><button class="button dismiss" data-action="Dismiss">Dismiss</button><button class="button" data-action="Defer">Defer</button><button class="button" data-action="Investigate">Investigate</button></div><div class="reason"><input id="reason" maxlength="1000" placeholder="Optional reason or feedback"><button class="button" id="save-note">Save note</button></div><div class="muted" style="margin-top:7px">Clinician action is not converted to an anomaly label; P2 learns only from explicit anomaly feedback.</div></div>`;
       document.querySelectorAll("[data-action]").forEach(button=>button.addEventListener("click",()=>submitAction(button.dataset.action)));

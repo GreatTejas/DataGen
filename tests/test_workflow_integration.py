@@ -31,7 +31,7 @@ def vital_event(event_id: str, minute: int, *, patient_id: str = "patient-1") ->
     }
 
 
-def test_pipeline_connects_p1_through_p4_placeholder():
+def test_pipeline_connects_p1_through_grounded_p4_reasoning():
     workflow = DeteriorationWorkflow()
     workflow.process_context({
         "patient_id": "patient-1",
@@ -44,8 +44,19 @@ def test_pipeline_connects_p1_through_p4_placeholder():
     assert "probability" in outputs[-1]["anomaly"]
     assert outputs[-1]["risk"]["risk_level"] in {"LOW", "MODERATE", "HIGH", "CRITICAL"}
     assert "final_confidence" in outputs[-1]["fusion"]
-    assert outputs[-1]["clinical_reasoning"]["status"] == "not_implemented"
-    assert outputs[-1]["clinical_reasoning"]["citations"] == []
+    reasoning = outputs[-1]["clinical_reasoning"]
+    assert reasoning["model"] == "deterministic-p4"
+    assert reasoning["explanation"]
+    assert reasoning["recommended_action"]
+    assert reasoning["citations"]
+    assert all(
+        citation["document_id"] and citation["version"] and citation["locator"]
+        for citation in reasoning["citations"]
+    )
+    assert any(
+        factor.startswith("anomaly probability ")
+        for factor in reasoning["contributing_factors"]
+    )
 
 
 def test_clinician_action_does_not_become_anomaly_label():

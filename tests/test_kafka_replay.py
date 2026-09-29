@@ -118,5 +118,5 @@ def test_consumer_runs_pipeline_and_emits_explicit_p4_handoff():
     assert topic == EVIDENCE_TOPIC
     assert key == "consumer-patient"
     assert handoff["agent_outputs"]["risk"]["risk_level"]
-    assert handoff["person4_clinical_reasoning"]["status"] == "not_implemented"
-    assert handoff["person4_clinical_reasoning"]["citations"] == []
+    assert handoff["person4_clinical_reasoning"]["model"] == "deterministic-p4"
+    assert handoff["person4_clinical_reasoning"]["citations"]

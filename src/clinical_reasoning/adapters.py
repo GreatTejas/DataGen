@@ -29,6 +29,13 @@ def trend_evidence(result: Any)->TrendEvidence:
 
 def anomaly_evidence(result: Any)->AnomalyEvidence:
     if result is None: return AnomalyEvidence()
+    if isinstance(result, Mapping):
+        return AnomalyEvidence(
+            float(result.get("probability", 0.0)),
+            bool(result.get("is_anomalous", False)),
+            list(result.get("contributing_features", []) or []),
+            result.get("model_version"),
+        )
     return AnomalyEvidence(float(getattr(result,"probability",0.0)),bool(getattr(result,"is_anomalous",False)),list(getattr(result,"contributing_features",[]) or []),getattr(result,"model_version",None))
 
 def risk_evidence(result: Any)->RiskEvidence:
