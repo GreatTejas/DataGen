@@ -1,4 +1,5 @@
 """Compatibility contract for P3 modules importing clinical_data_gen.trend."""
+"""Shared trend result contract for P1 and downstream components."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -7,6 +8,8 @@ from typing import Any
 
 @dataclass(frozen=True)
 class TrendResult:
+    """Deterministic trend-analysis result passed to P3."""
+
     patient_id: str
     timestamp: Any = None
     score: float = 0.0

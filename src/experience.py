@@ -114,6 +114,8 @@ class InMemoryExperienceStore(ExperienceStore):
     ) -> list[tuple[HistoricalCase, float]]:
         results: list[tuple[HistoricalCase, float]] = []
         for case in self._cases.values():
+            if case.clinician_decision is None and case.outcome is None:
+                continue
             candidate_vector = case_feature_vector(case)
             similarity = self.similarity_scorer.similarity(
                 list(feature_vector),
@@ -253,7 +255,8 @@ def build_case_feature_vector(
         _extract_anomaly_score(anomaly_result),
         _extract_risk_score(risk_result),
     ]
-    return [_normalize_feature("HR", value) for value in values[:5]] + [
+    vital_names = ("HR", "O2Sat", "Resp", "SBP", "DBP")
+    return [_normalize_feature(name, value) for name, value in zip(vital_names, values[:5])] + [
         float(values[5]),
         float(values[6]),
         float(values[7]),
@@ -276,7 +279,8 @@ def case_feature_vector(case: HistoricalCase) -> list[float]:
         float(case.anomaly_confidence),
         float(case.risk_score),
     ]
-    return [_normalize_feature("HR", value) for value in values[:5]] + [
+    vital_names = ("HR", "O2Sat", "Resp", "SBP", "DBP")
+    return [_normalize_feature(name, value) for name, value in zip(vital_names, values[:5])] + [
         float(values[5]),
         float(values[6]),
         float(values[7]),
@@ -319,11 +323,14 @@ def _extract_feature_value(
         "DBP": ("DBP", "diastolic_bp", "diastolic"),
     }
     for alias in aliases.get(vital_name, (vital_name,)):
-        observation = vitals.get(alias)
-        if isinstance(observation, Mapping):
-            value = observation.get("value")
-        else:
-            value = observation
+        value = vitals.get(alias)
+        for _ in range(3):
+            if isinstance(value, Mapping):
+                value = value.get("value")
+            elif hasattr(value, "value"):
+                value = value.value
+            else:
+                break
         if value is not None:
             return float(value)
     return float(default)

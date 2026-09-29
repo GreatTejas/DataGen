@@ -1,5 +1,6 @@
 from __future__ import annotations
 import argparse, json, time
+from datetime import datetime, timezone
 from pathlib import Path
 from .generator import ClinicalDataGenerator, sha256, write_jsonl
 from .fit_physionet import write_fit
@@ -23,7 +24,12 @@ def generate(args: argparse.Namespace) -> None:
     manifest={"schema_version":config["schema_version"],"seed":args.seed,"patients":args.patients,"minutes":args.minutes,"run_id":records["vitals_observed"][0]["run_id"],"config_sha256":sha256(Path(args.config)),"params_sha256":sha256(Path(args.params)) if args.params else None,"knowledge_corpus_sha256":sha256(Path(args.knowledge)),"files":{p.name:sha256(p) for p in out.glob("*.jsonl")}}
     (out/"manifest.json").write_text(json.dumps(manifest,indent=2)); print(json.dumps(quality,indent=2))
 def replay(args: argparse.Namespace) -> None:
-    contexts,vitals=rows(Path(args.input)/"patient_context.jsonl"),rows(Path(args.input)/"vitals_observed.jsonl"); producer=None
+    if args.speed <= 0:
+        raise ValueError("--speed must be greater than zero")
+    contexts = rows(Path(args.input) / "patient_context.jsonl")
+    vitals = rows(Path(args.input) / "vitals_observed.jsonl")
+    vitals.sort(key=lambda event: _event_time(event["event_time"]))
+    producer=None
     if args.brokers:
         try:
             from confluent_kafka import Producer; producer=Producer({"bootstrap.servers":args.brokers})
@@ -32,8 +38,25 @@ def replay(args: argparse.Namespace) -> None:
         if producer: producer.produce(topic,key=e["patient_id"],value=json.dumps(e)); producer.poll(0)
         else: print(json.dumps({"topic":topic,"key":e["patient_id"],"value":e}))
     for e in contexts: emit("patient.context",e)
-    for e in vitals: emit("vitals.raw",e); time.sleep(1/max(args.speed,.01))
+    previous_time = None
+    for e in vitals:
+        current_time = _event_time(e["event_time"])
+        if previous_time is not None:
+            delay = (current_time - previous_time).total_seconds()
+            if delay < 0:
+                raise ValueError("Vital events are not ordered by event_time")
+            if delay:
+                time.sleep(delay / args.speed)
+        emit("vitals.raw",e)
+        previous_time = current_time
     if producer: producer.flush()
+
+def _event_time(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, ValueError) as exc:
+        raise ValueError(f"Invalid event_time during replay: {value!r}") from exc
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
 def main() -> None:
     p=argparse.ArgumentParser(); s=p.add_subparsers(required=True)
     g=s.add_parser("generate"); g.add_argument("--output",required=True); g.add_argument("--patients",type=int,default=60); g.add_argument("--minutes",type=int,default=180); g.add_argument("--seed",type=int,default=20260918); g.add_argument("--config",default="config/generator_config.json"); g.add_argument("--params",default="data/derived/physionet_2019_params.json"); g.add_argument("--knowledge",default="knowledge/protocol_corpus.jsonl"); g.add_argument("--reference"); g.add_argument("--fidelity-max-files",type=int,default=2500); g.set_defaults(func=generate)

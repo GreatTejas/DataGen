@@ -241,11 +241,7 @@ class RiskAssessor:
 
 def _extract_vital(current_vitals: Mapping[str, Any], vital_name: str) -> float | None:
     if vital_name in current_vitals:
-        observation = current_vitals.get(vital_name)
-        if isinstance(observation, Mapping):
-            value = observation.get("value")
-        else:
-            value = observation
+        value = _observation_value(current_vitals.get(vital_name))
         if value is not None:
             return float(value)
 
@@ -258,14 +254,21 @@ def _extract_vital(current_vitals: Mapping[str, Any], vital_name: str) -> float 
     }
     for alias in alias_map.get(vital_name, (vital_name,)):
         if alias in current_vitals:
-            observation = current_vitals.get(alias)
-            if isinstance(observation, Mapping):
-                value = observation.get("value")
-            else:
-                value = observation
+            value = _observation_value(current_vitals.get(alias))
             if value is not None:
                 return float(value)
     return None
+
+
+def _observation_value(observation: Any) -> Any:
+    for _ in range(3):
+        if isinstance(observation, Mapping):
+            observation = observation.get("value")
+        elif hasattr(observation, "value"):
+            observation = observation.value
+        else:
+            return observation
+    return observation
 
 
 def _normalized_deviation(

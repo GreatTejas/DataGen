@@ -29,6 +29,17 @@ class AnomalyResult:
     model_version: int
 
 
+@dataclass(frozen=True)
+class AnomalyFeedback:
+    """Clinician feedback with anomaly correctness kept separate from action."""
+
+    patient_id: str
+    timestamp: Any
+    anomaly_label: bool | None
+    decision: str | None = None
+    reason: str | None = None
+
+
 class AnomalyAgent:
     """
     Online anomaly-learning agent.
@@ -109,8 +120,8 @@ class AnomalyAgent:
     def update(
         self,
         state: PatientState,
-        label: int,
-    ) -> float:
+        label: int | AnomalyFeedback,
+    ) -> float | None:
         """
         Update the online model using an explicit binary anomaly label.
 
@@ -120,6 +131,17 @@ class AnomalyAgent:
         pipeline, clinician feedback should only be converted into an
         anomaly label when the feedback semantics explicitly support that.
         """
+
+        if isinstance(label, AnomalyFeedback):
+            if label.patient_id != state.patient_id:
+                raise ValueError("Feedback patient_id does not match PatientState")
+            if label.decision is not None and label.decision.lower() not in {
+                "accept", "dismiss", "defer", "investigate"
+            }:
+                raise ValueError(f"Unsupported clinician decision: {label.decision!r}")
+            if label.anomaly_label is None:
+                return None
+            label = int(label.anomaly_label)
 
         feature_vector = self.feature_extractor.extract(state)
 

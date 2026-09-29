@@ -3,11 +3,7 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
-import time
-import urllib.error
-import urllib.request
 from collections import defaultdict
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,18 +11,21 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+for import_path in (ROOT, ROOT / "src"):
+    if str(import_path) not in sys.path:
+        sys.path.insert(0, str(import_path))
 
 from clinician_app.evaluation import calculate_metrics
 from clinician_app.policy import CHANNELS, evaluate_stream
+from clinical_data_gen.pipeline import DeteriorationWorkflow
 
 DATA = ROOT / "data" / "generated"
 AUDIT = ROOT / "data" / "evaluation" / "clinician_audit.jsonl"
 FEEDBACK = ROOT / "data" / "evaluation" / "clinician_feedback.jsonl"
 PORT = int(os.environ.get("CLINICIAN_APP_PORT", "8765"))
-POLICY_VERSION = "person5-observed-policy-v6"
-LAST_SUGGESTIONS: dict[str, dict[str, str]] = {}
+POLICY_VERSION = "integrated-observed-policy-v7"
+_WORKFLOW_CACHE_KEY: tuple[str, int, str] | None = None
+_WORKFLOW: DeteriorationWorkflow | None = None
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -53,6 +52,39 @@ def input_data() -> tuple[list[dict[str, Any]], dict[str, dict], list[dict], dic
     return events, contexts, episodes, labels
 
 
+def workflow_for(
+    events: list[dict[str, Any]],
+    contexts: dict[str, dict[str, Any]],
+) -> DeteriorationWorkflow:
+    """Build the observed-only agent workflow once for each generated cohort."""
+    global _WORKFLOW_CACHE_KEY, _WORKFLOW
+    if not events:
+        raise ValueError("Cannot initialize the workflow without vital events")
+    cache_key = (
+        str(events[0].get("run_id", "")),
+        len(events),
+        str(events[-1].get("event_id", "")),
+    )
+    if _WORKFLOW is None or _WORKFLOW_CACHE_KEY != cache_key:
+        workflow = DeteriorationWorkflow()
+        context_events = [
+            {"patient_id": patient_id, "payload": payload}
+            for patient_id, payload in contexts.items()
+        ]
+        workflow.process_events(events, context_events)
+        for record in read_jsonl(AUDIT):
+            if record.get("event_type") == "clinician_decision":
+                event_id = record.get("event_id")
+                if event_id in workflow.results:
+                    workflow.record_clinician_feedback(
+                        event_id,
+                        str(record.get("action", "Investigate")),
+                        str(record.get("reason", "")),
+                    )
+        _WORKFLOW, _WORKFLOW_CACHE_KEY = workflow, cache_key
+    return _WORKFLOW
+
+
 def trend_summary(history: list[dict[str, Any]], key: str) -> float:
     prior, recent = history[-20:-10], history[-10:]
     if not prior or not recent:
@@ -61,7 +93,12 @@ def trend_summary(history: list[dict[str, Any]], key: str) -> float:
     return round(mean(recent) - mean(prior), 1)
 
 
-def make_audit_traces(events: list[dict], decisions: dict[str, list[dict]], contexts: dict[str, dict]) -> list[dict]:
+def make_audit_traces(
+    events: list[dict],
+    decisions: dict[str, list[dict]],
+    contexts: dict[str, dict],
+    agent_outputs_by_event: dict[str, dict[str, Any]] | None = None,
+) -> list[dict]:
     """Create one idempotent policy/observation trace per generated reading."""
     old_audit = read_jsonl(AUDIT)
     current_event_ids = {x.get("event_id") for x in events}
@@ -96,15 +133,26 @@ def make_audit_traces(events: list[dict], decisions: dict[str, list[dict]], cont
             observed = payload.get("vitals", {})
             recent = (recent + [{"time": event["event_time"], **observed}])[-20:]
             trend = {name: trend_summary(recent, name) for name in CHANNELS}
+            agent_outputs = (agent_outputs_by_event or {}).get(str(event_id), {})
             traces.append({
                 "event_type": "policy_evaluation", "timestamp": event["event_time"],
                 "event_id": event_id, "patient_id": patient_id, "policy_version": POLICY_VERSION,
                 "run_id": event.get("run_id"),
                 "observation": {"vitals": observed, "quality": payload.get("quality", "unknown"), "schema_version": event.get("schema_version")},
                 "patient_context": contexts.get(patient_id, {}),
-                "agent_outputs": {"trend_summary_demo": trend, "person5_baseline_rule_score": decision["evidence"], "anomaly_agent": None, "risk_assessor": None},
-                "retrieved_evidence": [], "citations": [],
-                "reasoning": decision["policy_reason"],
+                "agent_outputs": {
+                    "person1_trend": agent_outputs.get("trend"),
+                    "person2_anomaly": agent_outputs.get("anomaly"),
+                    "person3_risk": agent_outputs.get("risk"),
+                    "person3_experience": agent_outputs.get("experience"),
+                    "person3_fusion": agent_outputs.get("fusion"),
+                    "person4_clinical_reasoning": agent_outputs.get("clinical_reasoning"),
+                    "trend_summary_demo": trend,
+                    "person5_alert_policy": decision["evidence"],
+                },
+                "retrieved_evidence": (agent_outputs.get("clinical_reasoning") or {}).get("retrieved_evidence", []),
+                "citations": (agent_outputs.get("clinical_reasoning") or {}).get("citations", []),
+                "reasoning": (agent_outputs.get("clinical_reasoning") or {}).get("message"),
                 "alert": {"decision": decision["policy"], "priority": decision["priority"], "evidence": decision["evidence"].get("flags", [])},
                 "source": "generated_mock_replay", "mock_data": True,
             })
@@ -115,10 +163,12 @@ def make_audit_traces(events: list[dict], decisions: dict[str, list[dict]], cont
 def dashboard() -> dict[str, Any]:
     events, contexts, episodes, labels = input_data()
     if not events:
-        return {"cases": [], "metrics": {}, "audit": [], "mode": "Demo reasoning", "patient_count": 0,
+        return {"cases": [], "metrics": {}, "audit": [], "mode": "Integrated demo · P4 pending", "patient_count": 0,
                 "error": "No generated mock data found. Generate a cohort first, then refresh."}
-    decisions = evaluate_stream(events)
-    make_audit_traces(events, decisions, contexts)
+    workflow = workflow_for(events, contexts)
+    agent_outputs = workflow.results
+    decisions = evaluate_stream(events, agent_outputs)
+    make_audit_traces(events, decisions, contexts, agent_outputs)
     event_groups: dict[str, list[dict]] = defaultdict(list)
     for event in events:
         event_groups[event["patient_id"]].append(event)
@@ -131,6 +181,7 @@ def dashboard() -> dict[str, Any]:
         stream.sort(key=lambda x: x["event_time"])
         latest = stream[-1]
         latest_decision = next((x for x in reversed(decisions[patient_id]) if x.get("event_id") == latest.get("event_id")), decisions[patient_id][-1])
+        latest_agents = agent_outputs[latest["event_id"]]
         history = [{"time": x["event_time"], **x["payload"]["vitals"]} for x in stream[-30:]]
         context = contexts.get(patient_id, {})
         baseline = latest_decision["baseline"]
@@ -140,80 +191,22 @@ def dashboard() -> dict[str, Any]:
             "vitals": latest["payload"]["vitals"], "baseline": baseline, "history": history, "context": context,
             "priority": latest_decision["priority"], "policy": latest_decision["policy"],
             "policy_reason": latest_decision["policy_reason"], "factors": flags or ["No sustained multi-parameter change detected"],
-            "explanation": "Observed-data summary: " + ("; ".join(flags) if flags else "recent vital signs do not meet the persistent escalation rule."),
-            "recommendation": "Review the recent observations and follow local escalation procedures when clinically indicated.",
+            "explanation": latest_agents["trend"]["explanation"],
+            "recommendation": latest_agents["clinical_reasoning"]["message"],
             "quality": latest.get("payload", {}).get("quality", "unknown"),
+            "agents": latest_agents,
+            "clinical_reasoning": latest_agents["clinical_reasoning"],
             "last_action": action_by_patient.get(patient_id),
         })
     cases.sort(key=lambda x: ({"High": 0, "Medium": 1, "Low": 2}.get(x["priority"], 3), x["patient_id"]))
     traces = [x for x in read_jsonl(AUDIT) if x.get("event_type") == "policy_evaluation"]
     metrics, _ = calculate_metrics(decisions, episodes, labels, traces)
     return {"cases": cases, "metrics": metrics, "audit": clinician_records[-12:],
-            "mode": "Gemini connected" if os.getenv("GEMINI_API_KEY") else "Demo reasoning",
+            "mode": "Integrated demo · P4 pending",
             "patient_count": len(event_groups)}
 
 
 CLINICIAN_ACTIONS = ("Accept", "Dismiss", "Defer", "Investigate")
-
-
-def gemini_suggestion(case: dict[str, Any]) -> dict[str, Any]:
-    """Recommend one clinician-interface action from the visible patient evidence."""
-    key = os.getenv("GEMINI_API_KEY")
-    if not key:
-        policy = case.get("policy", "SUPPRESS")
-        suggested = {"ALERT": "Accept", "DEFER": "Defer", "SUPPRESS": "Dismiss"}.get(policy, "Investigate")
-        if policy == "ALERT" and case.get("priority") != "High":
-            suggested = "Investigate"
-        if case.get("quality") == "suspect":
-            suggested = "Investigate"
-        return {"suggested_action": suggested,
-                "reason": f"Demo rule fallback: policy is {policy} ({case.get('priority', 'Low')} priority). "
-                          f"{case.get('policy_reason', 'Review the displayed patient evidence before deciding.')}",
-                "provider": "Demo rule fallback"}
-    model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-    fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.7-flash")
-    prompt = (
-        "You help a clinician review generated mock patient observations. Use only the supplied patient data and alert evidence. "
-        "Choose exactly one action from Accept, Dismiss, Defer, Investigate. Accept endorses the displayed alert for clinician review; "
-        "Dismiss means the current evidence does not support it; Defer means wait for more readings; Investigate means verify data quality "
-        "or request closer human review. Missing or suspect data should favor Investigate or Defer. Do not diagnose or prescribe. "
-        "Return exactly two lines, with no markdown: ACTION: <one action> and REASON: <one concise evidence-based sentence>.\n\n"
-        "Patient data:\n" + json.dumps(case, ensure_ascii=False) + "\n\nChoose the action now."
-    )
-    # Plain text avoids the JSON response-format enum rejected by this API endpoint.
-    body = json.dumps({"contents": [{"parts": [{"text": prompt}]}],
-                       "generationConfig": {"maxOutputTokens": 512,
-                                            "thinkingConfig": {"thinkingLevel": "low"}}}).encode()
-    # Retry transient capacity/rate errors on the primary, then use the currently
-    # supported previous Flash model if the primary remains overloaded.
-    attempts = [model, model] + ([fallback_model] if fallback_model != model else [])
-    last_error: Exception | None = None
-    for attempt_index, attempt_model in enumerate(attempts):
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{attempt_model}:generateContent"
-        request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", "x-goog-api-key": key}, method="POST")
-        try:
-            with urllib.request.urlopen(request, timeout=20) as response:
-                data = json.loads(response.read())
-            answer = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-            action_match = re.search(r"(?im)^\s*ACTION\s*:\s*(Accept|Dismiss|Defer|Investigate)\s*[.!]?\s*$", answer)
-            reason_match = re.search(r"(?im)^\s*REASON\s*:\s*(.+?)\s*$", answer)
-            if not action_match:
-                raise ValueError("Gemini did not return a valid ACTION line. Try again.")
-            reason = reason_match.group(1).strip() if reason_match else answer[:1000]
-            return {"suggested_action": action_match.group(1), "reason": reason, "provider": attempt_model}
-        except urllib.error.HTTPError as exc:
-            details = exc.read().decode("utf-8", errors="replace")
-            try:
-                details = json.loads(details).get("error", {}).get("message", details)
-            except json.JSONDecodeError:
-                pass
-            last_error = RuntimeError(f"Gemini HTTP {exc.code}: {details[:1000]}")
-            if exc.code not in {429, 500, 502, 503, 504} or attempt_index == len(attempts) - 1:
-                raise last_error from exc
-            time.sleep(1 if attempt_index == 0 else 0.5)
-        except (urllib.error.URLError, KeyError, IndexError, json.JSONDecodeError, ValueError) as exc:
-            raise RuntimeError(f"Gemini request failed: {exc}") from exc
-    raise RuntimeError(str(last_error or "Gemini request failed"))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -246,6 +239,9 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             self.send_json({"error": "Invalid JSON"}, 400)
             return
+        if not isinstance(body, dict):
+            self.send_json({"error": "Request body must be a JSON object"}, 400)
+            return
         if self.path == "/api/action":
             action, patient_id = body.get("action"), body.get("patient_id")
             if action not in {"Accept", "Dismiss", "Defer", "Investigate"} or not patient_id:
@@ -257,42 +253,42 @@ class Handler(BaseHTTPRequestHandler):
                 return
             now = datetime.now().astimezone().isoformat()
             reason = str(body.get("reason", ""))[:1000]
-            suggestion = body.get("gemini_suggestion") or LAST_SUGGESTIONS.get(patient_id)
-            if not isinstance(suggestion, dict) or suggestion.get("suggested_action") not in CLINICIAN_ACTIONS:
-                suggestion = None
-            elif suggestion:
-                suggestion = {key: suggestion.get(key) for key in ("suggested_action", "reason", "provider")}
+            events, contexts, _, _ = input_data()
+            workflow = workflow_for(events, contexts)
+            try:
+                learning_update = workflow.record_clinician_feedback(
+                    current["event_id"],
+                    action,
+                    reason,
+                )
+            except (KeyError, ValueError) as exc:
+                self.send_json({"error": str(exc)}, 400)
+                return
+            agent_outputs = current["agents"]
             decision = {"event_type": "clinician_decision", "timestamp": now, "patient_id": patient_id,
                         "event_id": current["event_id"], "action": action, "reason": reason,
-                        "observation": current["vitals"], "agent_outputs": {"alert_policy": {"decision": current["policy"], "priority": current["priority"]}},
-                        "retrieved_evidence": [], "citations": [], "reasoning": current["explanation"],
-                        "gemini_suggestion": suggestion,
+                        "observation": current["vitals"], "agent_outputs": {
+                            "person1_trend": agent_outputs["trend"],
+                            "person2_anomaly": agent_outputs["anomaly"],
+                            "person3_risk": agent_outputs["risk"],
+                            "person3_experience": agent_outputs["experience"],
+                            "person3_fusion": agent_outputs["fusion"],
+                            "person4_clinical_reasoning": agent_outputs["clinical_reasoning"],
+                            "person5_alert_policy": {"decision": current["policy"], "priority": current["priority"]},
+                        },
+                        "retrieved_evidence": agent_outputs["clinical_reasoning"]["retrieved_evidence"],
+                        "citations": agent_outputs["clinical_reasoning"]["citations"],
+                        "reasoning": agent_outputs["clinical_reasoning"]["message"],
                         "alert": {"decision": current["policy"], "priority": current["priority"]}, "source": "clinician_interface_demo", "mock_data": True}
             append_jsonl(AUDIT, [decision])
             feedback = {"timestamp": now, "patient_id": patient_id, "event_id": current["event_id"],
-                        "features": current["vitals"], "alert_policy_decision": current["policy"],
-                        "gemini_suggestion": suggestion, "clinician_action": action, "feedback": reason,
+                        "features": current["vitals"], "model_version": agent_outputs["anomaly"]["model_version"],
+                        "alert_policy_decision": current["policy"], "clinician_action": action,
+                        "anomaly_label": None, "online_model_updated": learning_update["model_updated"],
+                        "feedback": reason,
                         "source": "clinician_interface_demo", "mock_data": True}
             append_jsonl(FEEDBACK, [feedback])
-            self.send_json({"ok": True, "record": decision})
-            return
-        if self.path == "/api/reason":
-            try:
-                case = body["case"]
-                suggestion = gemini_suggestion(case)
-                if case.get("patient_id"):
-                    LAST_SUGGESTIONS[case["patient_id"]] = suggestion
-                now = datetime.now().astimezone().isoformat()
-                append_jsonl(AUDIT, [{"event_type": "reasoning_generated", "timestamp": now,
-                    "event_id": case.get("event_id"), "patient_id": case.get("patient_id"),
-                    "observation": case.get("vitals", {}), "agent_outputs": {"alert_policy": {"decision": case.get("policy"), "priority": case.get("priority")}},
-                    "retrieved_evidence": [], "citations": [], "reasoning": suggestion["reason"],
-                    "alert": {"decision": case.get("policy"), "priority": case.get("priority")},
-                    "suggested_action": suggestion["suggested_action"], "model": suggestion["provider"],
-                    "source": "clinician_interface_demo", "mock_data": True}])
-                self.send_json({**suggestion, "mode": "Gemini" if os.getenv("GEMINI_API_KEY") else "Demo"})
-            except (RuntimeError, KeyError) as exc:
-                self.send_json({"error": str(exc)}, 502)
+            self.send_json({"ok": True, "record": decision, "learning_update": learning_update})
             return
         self.send_error(404)
 
@@ -302,5 +298,5 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     print(f"Clinician demo: http://127.0.0.1:{PORT}")
-    print("Generated mock data only. Set GEMINI_API_KEY to enable Gemini summaries.")
+    print("Generated mock data only. P4 RAG and clinical reasoning are placeholders.")
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
