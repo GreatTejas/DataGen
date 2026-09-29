@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
-from trend_agent import TrendAgent
+from trend_agent.trend_agent import TrendAgent
 
 
 def read_jsonl(path: Path) -> Iterable[dict[str, Any]]:

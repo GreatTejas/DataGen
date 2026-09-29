@@ -17,7 +17,15 @@ dependencies = [
 clinical-data-gen = "clinical_data_gen.cli:main"
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["src", "."]
+include = ["clinical_data_gen*", "ingestion*", "trend_agent*"]
+
+[tool.setuptools]
+py-modules = ["experience", "fusion", "risk", "trend"]
+package-dir = {"" = "src", "trend_agent" = "trend_agent"}
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
 
 [dependency-groups]
 dev = [

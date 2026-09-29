@@ -12,7 +12,11 @@ def _time(event: dict[str, Any]) -> datetime:
     return datetime.fromisoformat(event["event_time"])
 
 
-def score_event(vitals: dict[str, float], baseline: dict[str, float]) -> dict[str, Any]:
+def score_event(
+    vitals: dict[str, float],
+    baseline: dict[str, float],
+    agent_outputs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Return simple patient-baseline and absolute-threshold evidence."""
     flags: list[str] = []
     critical: list[str] = []
@@ -38,11 +42,44 @@ def score_event(vitals: dict[str, float], baseline: dict[str, float]) -> dict[st
                 ("systolic_bp", vitals["systolic_bp"] <= 80))
     critical = [channel for channel, condition in absolute if condition]
     cross_system = len(set(flagged_channels)) >= 2 and any(name in flagged_channels for name in ("spo2", "systolic_bp", "fio2"))
+    upstream = agent_outputs or {}
+    trend = upstream.get("trend") or {}
+    risk = upstream.get("risk") or {}
+    anomaly = upstream.get("anomaly") or {}
+    trend_candidate = bool(trend.get("candidate_deterioration_trend"))
+    risk_score = float(risk.get("risk_score", 0.0))
+    risk_level = str(risk.get("risk_level", "LOW")).upper()
+    anomaly_probability = float(anomaly.get("probability", 0.0))
+    upstream_eligible = risk_level in {"HIGH", "CRITICAL"} and trend_candidate
+    if trend_candidate:
+        flags.append("Trend analyzer detected sustained multi-vital change")
+    if risk_level in {"HIGH", "CRITICAL"}:
+        flags.append(f"Risk assessor: {risk_level} ({risk_score:.2f})")
+    if anomaly_probability >= 0.75:
+        flags.append(f"Anomaly confidence: {anomaly_probability:.2f}")
     return {"flags": flags, "flagged_channels": sorted(set(flagged_channels)), "critical_vitals": critical,
-            "score": len(flags), "alert_eligible": len(flags) >= 3 or cross_system}
+            "score": len(flags), "baseline_score": len(tests) and sum(
+                condition for _, condition, _ in tests
+            ), "baseline_flags": [
+                label for _, condition, label in tests if condition
+            ], "upstream_eligible": upstream_eligible,
+            "upstream_evidence": {
+                "trend_candidate": trend_candidate,
+                "risk_score": risk_score,
+                "risk_level": risk_level,
+                "anomaly_probability": anomaly_probability,
+                "anomaly_alone_is_alert": False,
+            },
+            "alert_eligible": len([label for _, condition, label in tests if condition]) >= 3
+            or cross_system or upstream_eligible}
 
 
-def evaluate_patient(events: list[dict[str, Any]], *, cooldown_minutes: int = COOLDOWN_MINUTES) -> list[dict[str, Any]]:
+def evaluate_patient(
+    events: list[dict[str, Any]],
+    *,
+    cooldown_minutes: int = COOLDOWN_MINUTES,
+    agent_outputs_by_event: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """Score an ordered patient stream and apply persistence, QC, priority, and cooldown."""
     events = sorted(events, key=_time)
     if not events:
@@ -62,7 +99,8 @@ def evaluate_patient(events: list[dict[str, Any]], *, cooldown_minutes: int = CO
         observed = event.get("payload", {}).get("vitals", {})
         if not all(key in observed for key in CHANNELS):
             continue
-        evidence = score_event(observed, base)
+        upstream = (agent_outputs_by_event or {}).get(str(event.get("event_id")), {})
+        evidence = score_event(observed, base, upstream)
         quality = event.get("payload", {}).get("quality", "unknown")
         persistence_evidence = evidence if quality != "suspect" else {"score": 0, "critical_vitals": [], "alert_eligible": False}
         recent = (recent + [persistence_evidence])[-3:]
@@ -72,7 +110,11 @@ def evaluate_patient(events: list[dict[str, Any]], *, cooldown_minutes: int = CO
             len(set(item.get("critical_vitals", []))) >= 2 for item in recent
         )
         confirmed = persistent
-        priority = "High" if len(flags) >= 3 or critical_persistent else "Medium"
+        priority = "High" if (
+            len(evidence["baseline_flags"]) >= 3
+            or critical_persistent
+            or evidence["upstream_eligible"]
+        ) else "Medium"
         if quality == "suspect":
             policy, priority, reason = "SUPPRESS", "Low", "Signal quality is suspect; repeat measurement before escalation."
             quiet_readings = 0
@@ -90,7 +132,7 @@ def evaluate_patient(events: list[dict[str, Any]], *, cooldown_minutes: int = CO
                 policy, priority, reason = "SUPPRESS", "Low", "Duplicate alert suppressed while the same episode remains active (cooldown)."
             elif elapsed is None or elapsed >= cooldown_minutes:
                 policy = "ALERT"
-                reason = "Persistent multi-parameter or critical deterioration pattern confirmed."
+                reason = "Persistent baseline or corroborated trend/risk evidence confirmed."
                 last_alert_at, last_priority = _time(event), priority
                 alert_episode_active = True
             else:
@@ -111,12 +153,22 @@ def evaluate_patient(events: list[dict[str, Any]], *, cooldown_minutes: int = CO
             "quality": quality, "baseline": {k: round(v, 2) for k, v in base.items()},
             "evidence": evidence, "persistence_confirmed": confirmed,
             "policy": policy, "priority": priority, "policy_reason": reason,
+            "agent_outputs": upstream,
         })
     return decisions
 
 
-def evaluate_stream(events: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+def evaluate_stream(
+    events: list[dict[str, Any]],
+    agent_outputs_by_event: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
     by_patient: dict[str, list[dict[str, Any]]] = {}
     for event in events:
         by_patient.setdefault(event["patient_id"], []).append(event)
-    return {patient_id: evaluate_patient(rows) for patient_id, rows in by_patient.items()}
+    return {
+        patient_id: evaluate_patient(
+            rows,
+            agent_outputs_by_event=agent_outputs_by_event,
+        )
+        for patient_id, rows in by_patient.items()
+    }

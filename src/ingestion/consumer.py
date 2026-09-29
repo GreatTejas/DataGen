@@ -1,6 +1,8 @@
 import json
+import os
 import signal
 from datetime import datetime, timezone
+from typing import Any
 
 from confluent_kafka import (
     Consumer,
@@ -8,18 +10,20 @@ from confluent_kafka import (
     KafkaError,
 )
 
-from pydantic import ValidationError
+from clinical_data_gen.pipeline import DeteriorationWorkflow
+from .models import VitalEvent, validate_context_event
 
-from models import VitalEvent
-
-KAFKA_BROKER = "localhost:9092"
+KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "localhost:9092")
 
 INPUT_TOPIC = "vitals.raw"
+CONTEXT_TOPIC = "patient.context"
+EVIDENCE_TOPIC = "patient.evidence"
 DLQ_TOPIC = "vitals.dlq"
 
 GROUP_ID = "clinical-ingestion-v1"
 
 running = True
+workflow = DeteriorationWorkflow()
 
 
 def shutdown_handler(signum, frame):
@@ -74,6 +78,29 @@ def create_producer() -> Producer:
     )
 
 
+def publish_confirmed(
+    producer: Producer,
+    *,
+    topic: str,
+    key: str,
+    value: bytes,
+) -> None:
+    delivery_errors = []
+
+    def on_delivery(error: Any, _message: Any) -> None:
+        if error is not None:
+            delivery_errors.append(str(error))
+
+    producer.produce(topic=topic, key=key, value=value, callback=on_delivery)
+    producer.poll(0)
+    remaining = producer.flush(timeout=10)
+    if remaining or delivery_errors:
+        raise RuntimeError(
+            f"Kafka delivery failed for topic {topic}: "
+            f"pending={remaining}, errors={delivery_errors}"
+        )
+
+
 # =========================================================
 # Validation
 # =========================================================
@@ -119,6 +146,18 @@ def validate_ranges(
 
             errors.append(f"invalid diastolic_bp=" f"{event.diastolic_bp}")
 
+    if event.temperature is not None and not 25 <= event.temperature <= 45:
+        errors.append(f"invalid temperature={event.temperature}")
+
+    if (
+        event.mean_arterial_pressure is not None
+        and not 0 < event.mean_arterial_pressure <= 300
+    ):
+        errors.append(f"invalid map={event.mean_arterial_pressure}")
+
+    if event.fio2 is not None and not 0.21 <= event.fio2 <= 1:
+        errors.append(f"invalid fio2={event.fio2}")
+
     return errors
 
 
@@ -150,8 +189,7 @@ def normalize_event(
     event: VitalEvent,
 ) -> VitalEvent:
 
-    # Pydantic has already normalized event_time
-    # to UTC.
+    # Event parsing normalizes naive timestamps to UTC.
     #
     # Keep this function as the boundary where
     # future source-specific normalization can go.
@@ -222,13 +260,12 @@ def publish_dlq(
             )
         )
 
-    producer.produce(
+    publish_confirmed(
+        producer,
         topic=DLQ_TOPIC,
         key=patient_id,
         value=json.dumps(payload).encode("utf-8"),
     )
-
-    producer.poll(0)
 
 
 # =========================================================
@@ -238,29 +275,31 @@ def publish_dlq(
 
 def process_valid_event(
     event: VitalEvent,
+    evidence_producer: Producer,
 ):
-    """
-    Downstream handoff.
-
-    For now this is just a placeholder.
-
-    Later this should call the Patient State
-    Manager / downstream component.
-
-    Example:
-
-        patient_state_manager.update(event)
-    """
-
+    observed_event = event.model_dump(mode="json")
+    agent_outputs = workflow.process_event(observed_event)
+    handoff = {
+        "event": observed_event,
+        "agent_outputs": agent_outputs,
+        "person4_clinical_reasoning": {
+            "status": "not_implemented",
+            "message": "P4 RAG and clinical reasoning are pending.",
+            "retrieved_evidence": [],
+            "citations": [],
+        },
+    }
+    publish_confirmed(
+        evidence_producer,
+        topic=EVIDENCE_TOPIC,
+        key=event.patient_id,
+        value=json.dumps(handoff).encode("utf-8"),
+    )
     print(
         "[DOWNSTREAM] "
-        f"patient={event.patient_id} "
-        f"event={event.event_id} "
-        f"HR={event.heart_rate} "
-        f"SpO2={event.spo2} "
-        f"RR={event.respiratory_rate} "
-        f"BP={event.systolic_bp}/"
-        f"{event.diastolic_bp}"
+        f"patient={event.patient_id} event={event.event_id} "
+        f"risk={agent_outputs['risk']['risk_level']} "
+        f"trend_candidate={agent_outputs['trend']['candidate_deterioration_trend']}"
     )
 
 
@@ -273,13 +312,17 @@ def run():
 
     consumer = create_consumer()
 
-    dlq_producer = create_producer()
+    output_producer = create_producer()
 
-    consumer.subscribe([INPUT_TOPIC])
+    consumer.subscribe([INPUT_TOPIC, CONTEXT_TOPIC])
 
     print(f"[CONSUMER] Broker: " f"{KAFKA_BROKER}")
 
     print(f"[CONSUMER] Input: " f"{INPUT_TOPIC}")
+
+    print(f"[CONSUMER] Context: " f"{CONTEXT_TOPIC}")
+
+    print(f"[CONSUMER] Evidence output: " f"{EVIDENCE_TOPIC}")
 
     print(f"[CONSUMER] DLQ: " f"{DLQ_TOPIC}")
 
@@ -305,23 +348,20 @@ def run():
             # 1. Deserialize
             # =================================================
 
+            raw_value = message.value() or b""
             try:
+                raw_event = json.loads(raw_value.decode("utf-8"))
 
-                raw_event = json.loads(message.value().decode("utf-8"))
-
-            except Exception as exc:
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
 
                 errors = [f"invalid JSON: {exc}"]
 
                 print("[INVALID JSON] " f"{errors}")
 
                 publish_dlq(
-                    producer=dlq_producer,
+                    producer=output_producer,
                     raw_event={
-                        "raw": message.value().decode(
-                            "utf-8",
-                            errors="replace",
-                        )
+                        "raw": raw_value.decode("utf-8", errors="replace")
                     },
                     errors=errors,
                 )
@@ -334,6 +374,25 @@ def run():
 
                 continue
 
+            if not isinstance(raw_event, dict):
+                errors = ["event must be a JSON object"]
+                publish_dlq(output_producer, {"raw": raw_event}, errors)
+                consumer.commit(message=message, asynchronous=False)
+                continue
+
+            # Patient context is consumed before vital replay and registered
+            # with the same stateful workflow used for vital events.
+            if message.topic() == CONTEXT_TOPIC:
+                try:
+                    workflow.process_context(validate_context_event(raw_event))
+                except (TypeError, ValueError) as exc:
+                    errors = [f"patient context validation failed: {exc}"]
+                    publish_dlq(output_producer, raw_event, errors)
+                    consumer.commit(message=message, asynchronous=False)
+                    continue
+                consumer.commit(message=message, asynchronous=False)
+                continue
+
             # =================================================
             # 2. Schema validation
             # =================================================
@@ -342,7 +401,7 @@ def run():
 
                 event = VitalEvent.model_validate(raw_event)
 
-            except ValidationError as exc:
+            except (TypeError, ValueError, KeyError) as exc:
 
                 errors = [
                     "schema validation failed",
@@ -357,7 +416,7 @@ def run():
                 )
 
                 publish_dlq(
-                    producer=dlq_producer,
+                    producer=output_producer,
                     raw_event=raw_event,
                     errors=errors,
                 )
@@ -391,7 +450,7 @@ def run():
                 )
 
                 publish_dlq(
-                    producer=dlq_producer,
+                    producer=output_producer,
                     raw_event=raw_event,
                     errors=errors,
                 )
@@ -430,7 +489,7 @@ def run():
 
             try:
 
-                process_valid_event(event)
+                process_valid_event(event, output_producer)
 
             except Exception as exc:
 
@@ -460,9 +519,9 @@ def run():
 
     finally:
 
-        print("[CONSUMER] Flushing DLQ producer...")
+        print("[CONSUMER] Flushing output producer...")
 
-        dlq_producer.flush()
+        output_producer.flush()
 
         print("[CONSUMER] Closing consumer...")
 

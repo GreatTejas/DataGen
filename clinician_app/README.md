@@ -1,32 +1,40 @@
 # Clinician review demo (Person 5)
 
-This local dashboard completes the Person 5 portion of the Team 38 deterioration-copilot demo. It reads the repository's generated `data/generated` mock cohort, shows patient observations against a personal baseline and the alert evidence, and records clinician actions in a local JSONL audit file. No external package is required.
+This local, mock-data-only dashboard connects the generated cohort to the integrated P1-P3 workflow and the P5 observed-data alert policy. It displays patient observations, baseline and trend context, anomaly and risk outputs, experience retrieval, evidence fusion, alert decisions, and the explicit P4-pending status. It does not consume Kafka messages; Kafka ingestion publishes P1-P3 handoffs to `patient.evidence` separately.
+
+This software is for demonstration and evaluation only. It is not for clinical care, diagnosis, treatment, or deployment.
 
 ## Run
 
-From the `DataGen-main` project folder:
+From the repository root:
 
 ```powershell
+python -m pip install -e .
 python clinician_app/server.py
 ```
 
-Open `http://127.0.0.1:8765`. To use another local port, set `CLINICIAN_APP_PORT` first.
+Open `http://127.0.0.1:8765`. Set `CLINICIAN_APP_PORT` to use a different local port. Generate a cohort with `python -m clinical_data_gen.cli generate --output data/generated` before opening the dashboard if no generated data is present.
 
-The **Ask Gemini to choose** button sends the selected patient's observed vitals, context, trend summary, and Person 5 policy result to Google's Gemini `generateContent` REST API. Gemini returns one structured suggestion from **Accept, Dismiss, Defer, or Investigate** plus an evidence-based reason. The clinician still chooses their own action; the suggestion is included in the audit/feedback record for later agreement analysis. Set `GEMINI_API_KEY` in the environment before starting the server; the key stays on the server and is not sent to the browser. The default model is `gemini-3.8-flash`; override with `GEMINI_MODEL` if needed. Without a key, the interface labels a deterministic Person 5 rule fallback, not a Gemini response.
+## P1-P5 handoff status
 
-```powershell
-$env:GEMINI_API_KEY = "your-key"
-python clinician_app/server.py
-```
+- **P1:** Generated observations feed the stateful trend analyzer. Kafka replay publishes context first and preserves event-time ordering.
+- **P2:** The dashboard workflow maintains patient state, anomaly estimates, and clinician-reviewed experience cases. Clinician actions are not automatically treated as anomaly labels, so they do not train the online anomaly model without an explicit label.
+- **P3:** Risk scoring, similar reviewed-case retrieval, and evidence fusion run for each observation.
+- **P4:** RAG and clinical reasoning are not implemented. The placeholder returns `not_implemented` with no retrieved evidence, citations, explanation, diagnosis, or treatment recommendation.
+- **P5:** The local dashboard applies the observed-data alert policy, accepts Accept, Dismiss, Defer, or Investigate actions, and records audit/feedback JSONL.
 
 ## Clinician actions and audit
 
-Accept, Dismiss, Defer, and Investigate actions (including an optional reason) append to `data/evaluation/clinician_audit.jsonl`. A feedback export for the Person 2 learning component is written to `data/evaluation/clinician_feedback.jsonl`; the teammate's learner is not yet connected, so this is an integration handoff file rather than a live model update. The audit JSONL also records every replayed observation, demo trend and policy output, explanation, empty RAG evidence/citation fields, and clinician decision.
+Actions and optional reasons append to `data/evaluation/clinician_audit.jsonl`; a learning handoff is also written to `data/evaluation/clinician_feedback.jsonl`. The feedback is recorded in the current in-memory workflow's experience memory. It is not persisted as an online model update, and an action without an explicit anomaly label never trains the anomaly model. Audit records include observed inputs, P1-P5 outputs, policy evidence, empty P4 evidence/citation fields, and clinician decisions.
 
-## Evaluation metrics (reference only)
+## Evaluation
 
-Metrics are available from the `/api/dashboard` endpoint for reference; they are intentionally not shown in the clinician interface. To create saved reports, run `python scripts/evaluate_alert_policy.py`. This writes `data/evaluation/alert_policy/metrics.json`, `episode_predictions.jsonl`, and `alert_events.jsonl`. The policy uses the first 30 observations as a patient baseline, requires at least two readings with persistent cross-system evidence in a three-reading window, ignores suspect-quality readings, deduplicates alerts during an active episode, and applies a 30-minute cooldown before a new episode alert. Its decision code never reads ground-truth labels; the evaluator reads those separate files only after policy predictions are produced. Episode precision groups alerts for the same patient within 30 minutes as one alert episode.
+`/api/dashboard` reports reference metrics. To create saved reports, run:
 
-The report includes episode precision and recall within the labelled escalation window, median lead time, alerts per patient-hour, duplicate suppression, artifact false-positive rate, RAG citation coverage, and audit completeness. These are demo metrics from a simple baseline-relative policy, not clinical validation results or metrics for the integrated multi-agent system. Citation coverage is zero until the RAG service is connected. Gemini action agreement can only be calculated after clinician actions have been recorded; agreement is a review signal and should not be presented as ground-truth clinical accuracy.
+```powershell
+python scripts/evaluate_alert_policy.py
+```
 
-The generator's separate online anomaly-model evaluation is in `data/evaluation/online_lr/metrics.json`. It evaluates event-level anomaly predictions and should not be combined with the episode-level alert-policy cards.
+The policy uses patient-specific warmup baselines from up to 30 observations, requires persistent evidence for alerting, suppresses suspect-quality readings, deduplicates an active alert episode, and applies a 30-minute cooldown. Ground-truth labels are read only by the offline evaluator, not by the live workflow or policy. Reported precision, recall, lead time, alerts per patient-hour, duplicate suppression, artifact false-positive rate, citation coverage, and audit completeness are demo metrics, not clinical validation results. RAG citation coverage remains zero until P4 is implemented.
+
+The generator's separate online anomaly-model evaluation is in `data/evaluation/online_lr/metrics.json`; it is event-level and should not be combined with episode-level alert-policy metrics.
