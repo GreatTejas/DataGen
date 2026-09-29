@@ -23,7 +23,7 @@ clinical-data-gen = "clinical_data_gen.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src", "."]
-include = ["clinical_data_gen*", "ingestion*", "trend_agent*"]
+include = ["clinical_data_gen*", "clinical_reasoning*", "ingestion*", "trend_agent*"]
 
 [tool.setuptools]
 py-modules = ["experience", "fusion", "risk", "trend"]

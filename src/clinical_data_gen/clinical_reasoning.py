@@ -1,4 +1,4 @@
-"""Explicit handoff for the pending Person 4 RAG and reasoning work."""
+"""Legacy pending-result contract retained for compatibility with older callers."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -26,7 +26,7 @@ class ClinicalReasoningResult:
 
 
 class ClinicalReasoningPlaceholder:
-    """Return an honest pending status until Person 4 supplies RAG/reasoning."""
+    """Return the legacy pending status; the live workflow uses P4Service."""
 
     def run(self, evidence: Any) -> ClinicalReasoningResult:
         del evidence

@@ -282,12 +282,7 @@ def process_valid_event(
     handoff = {
         "event": observed_event,
         "agent_outputs": agent_outputs,
-        "person4_clinical_reasoning": {
-            "status": "not_implemented",
-            "message": "P4 RAG and clinical reasoning are pending.",
-            "retrieved_evidence": [],
-            "citations": [],
-        },
+        "person4_clinical_reasoning": agent_outputs["clinical_reasoning"],
     }
     publish_confirmed(
         evidence_producer,
@@ -325,6 +320,12 @@ def run():
     print(f"[CONSUMER] Evidence output: " f"{EVIDENCE_TOPIC}")
 
     print(f"[CONSUMER] DLQ: " f"{DLQ_TOPIC}")
+
+    print(
+        "[CONSUMER] P4 retrieval: "
+        f"{os.environ.get('P4_RETRIEVAL_BACKEND', 'tfidf')}; "
+        f"live LLM: {os.environ.get('P4_LIVE_LLM', 'false')}"
+    )
 
     try:
 

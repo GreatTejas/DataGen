@@ -5,7 +5,7 @@ import json
 import os
 import sys
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -23,7 +23,7 @@ DATA = ROOT / "data" / "generated"
 AUDIT = ROOT / "data" / "evaluation" / "clinician_audit.jsonl"
 FEEDBACK = ROOT / "data" / "evaluation" / "clinician_feedback.jsonl"
 PORT = int(os.environ.get("CLINICIAN_APP_PORT", "8765"))
-POLICY_VERSION = "integrated-observed-policy-v7"
+POLICY_VERSION = "integrated-p4-policy-v8"
 _WORKFLOW_CACHE_KEY: tuple[str, int, str] | None = None
 _WORKFLOW: DeteriorationWorkflow | None = None
 
@@ -71,16 +71,30 @@ def workflow_for(
             {"patient_id": patient_id, "payload": payload}
             for patient_id, payload in contexts.items()
         ]
-        workflow.process_events(events, context_events)
+        for context in context_events:
+            workflow.process_context(context)
+        decisions_by_event: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for record in read_jsonl(AUDIT):
-            if record.get("event_type") == "clinician_decision":
-                event_id = record.get("event_id")
-                if event_id in workflow.results:
-                    workflow.record_clinician_feedback(
-                        event_id,
-                        str(record.get("action", "Investigate")),
-                        str(record.get("reason", "")),
-                    )
+            if record.get("event_type") == "clinician_decision" and record.get("event_id"):
+                decisions_by_event[str(record["event_id"])].append(record)
+        def event_time_key(event: dict[str, Any]) -> datetime:
+            timestamp = datetime.fromisoformat(
+                str(event["event_time"]).replace("Z", "+00:00")
+            )
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            return timestamp.astimezone(timezone.utc)
+
+        ordered_events = sorted(events, key=event_time_key)
+        for event in ordered_events:
+            event_id = str(event["event_id"])
+            workflow.process_event(event)
+            for decision in decisions_by_event.get(event_id, []):
+                workflow.record_clinician_feedback(
+                    event_id,
+                    str(decision.get("action", "Investigate")),
+                    str(decision.get("reason", "")),
+                )
         _WORKFLOW, _WORKFLOW_CACHE_KEY = workflow, cache_key
     return _WORKFLOW
 
@@ -150,9 +164,10 @@ def make_audit_traces(
                     "trend_summary_demo": trend,
                     "person5_alert_policy": decision["evidence"],
                 },
-                "retrieved_evidence": (agent_outputs.get("clinical_reasoning") or {}).get("retrieved_evidence", []),
+                "retrieved_evidence": (agent_outputs.get("clinical_reasoning") or {}).get("citations", []),
                 "citations": (agent_outputs.get("clinical_reasoning") or {}).get("citations", []),
-                "reasoning": (agent_outputs.get("clinical_reasoning") or {}).get("message"),
+                "reasoning": (agent_outputs.get("clinical_reasoning") or {}).get("explanation"),
+                "recommendation": (agent_outputs.get("clinical_reasoning") or {}).get("recommended_action"),
                 "alert": {"decision": decision["policy"], "priority": decision["priority"], "evidence": decision["evidence"].get("flags", [])},
                 "source": "generated_mock_replay", "mock_data": True,
             })
@@ -163,7 +178,7 @@ def make_audit_traces(
 def dashboard() -> dict[str, Any]:
     events, contexts, episodes, labels = input_data()
     if not events:
-        return {"cases": [], "metrics": {}, "audit": [], "mode": "Integrated demo · P4 pending", "patient_count": 0,
+        return {"cases": [], "metrics": {}, "audit": [], "mode": "Integrated demo · P4 active", "patient_count": 0,
                 "error": "No generated mock data found. Generate a cohort first, then refresh."}
     workflow = workflow_for(events, contexts)
     agent_outputs = workflow.results
@@ -192,7 +207,7 @@ def dashboard() -> dict[str, Any]:
             "priority": latest_decision["priority"], "policy": latest_decision["policy"],
             "policy_reason": latest_decision["policy_reason"], "factors": flags or ["No sustained multi-parameter change detected"],
             "explanation": latest_agents["trend"]["explanation"],
-            "recommendation": latest_agents["clinical_reasoning"]["message"],
+            "recommendation": latest_agents["clinical_reasoning"]["recommended_action"],
             "quality": latest.get("payload", {}).get("quality", "unknown"),
             "agents": latest_agents,
             "clinical_reasoning": latest_agents["clinical_reasoning"],
@@ -202,7 +217,7 @@ def dashboard() -> dict[str, Any]:
     traces = [x for x in read_jsonl(AUDIT) if x.get("event_type") == "policy_evaluation"]
     metrics, _ = calculate_metrics(decisions, episodes, labels, traces)
     return {"cases": cases, "metrics": metrics, "audit": clinician_records[-12:],
-            "mode": "Integrated demo · P4 pending",
+            "mode": "Integrated demo · P4 active",
             "patient_count": len(event_groups)}
 
 
@@ -276,9 +291,10 @@ class Handler(BaseHTTPRequestHandler):
                             "person4_clinical_reasoning": agent_outputs["clinical_reasoning"],
                             "person5_alert_policy": {"decision": current["policy"], "priority": current["priority"]},
                         },
-                        "retrieved_evidence": agent_outputs["clinical_reasoning"]["retrieved_evidence"],
+                        "retrieved_evidence": agent_outputs["clinical_reasoning"]["citations"],
                         "citations": agent_outputs["clinical_reasoning"]["citations"],
-                        "reasoning": agent_outputs["clinical_reasoning"]["message"],
+                        "reasoning": agent_outputs["clinical_reasoning"]["explanation"],
+                        "recommendation": agent_outputs["clinical_reasoning"]["recommended_action"],
                         "alert": {"decision": current["policy"], "priority": current["priority"]}, "source": "clinician_interface_demo", "mock_data": True}
             append_jsonl(AUDIT, [decision])
             feedback = {"timestamp": now, "patient_id": patient_id, "event_id": current["event_id"],

@@ -21,29 +21,42 @@ An event-time clinical decision-support prototype that turns a stream of patient
 
 ```mermaid
 flowchart LR
-    A[Event-time vital stream\nHR • SpO2 • RR • BP] --> B[Kafka / file replay\nvalidation]
-    C[Static patient context] --> D[Patient State Manager\nbaseline + history]
-    B --> D
-    D --> E[Trend Agent]
-    D --> F[Adaptive Anomaly Agent]
-    D --> G[Risk Assessor]
-    E --> H[Evidence Fusion]
-    F --> H
-    G --> H
-    I[Experience Memory] --> H
-    H --> J[Clinical Reasoning Agent]
-    K[Versioned protocol corpus\nlocal RAG] --> J
-    J --> L[Alert policy\npersist • deduplicate • cooldown]
-    L --> M[Clinician dashboard]
-    M --> N[Audit trail]
-    M --> O[Clinician feedback]
-    O --> F
-    O --> I
+    D[PhysioNet 2019 PSV files] --> F[Parameter & template fitting]
+    C[Seeded config] --> P[Patient profile factory]
+    F --> P
+    P --> B[Personalised baseline]
+    B --> T[Trajectory engine]
+    T --> N[Noise & artifact injector]
+    N --> V[VitalEvent JSONL]
+    T --> L[Label engine]
+    L --> G[Ground-truth episodes]
+    P --> X[Static patient context]
+    V --> KAFKA[(Kafka topic: vitals.raw)]
+    X --> KAFKA2[(Kafka topic: patient.context)]
+    G --> EVAL[Offline evaluator]
+    KAFKA --> INGEST[Validated Kafka consumer]
+    KAFKA2 --> INGEST
+    INGEST --> P1[P1 Trend]
+    P1 --> P2[P2 State + Anomaly + Learning]
+    P2 --> P3[P3 Risk + Evidence Fusion + Experience]
+    P3 --> HANDOFF[patient.evidence]
+    HANDOFF --> P4[P4 local RAG + Clinical Reasoning]
+    P4 --> P5[P5 Alert Policy + Review UI]
+    P5 --> AUDIT[Audit + clinician feedback]
+    AUDIT -. feedback .-> P2
+    FILES[Generated mock cohort] -. local demo input .-> P5
 ```
 
 Live agents receive observed events and static context only. Scenario names, latent state, and episode labels remain evaluation-only artifacts.
 
-## Requirements traceability
+| Stream | Kafka topic | Key | Purpose |
+| --- | --- | --- | --- |
+| Vital readings | `vitals.raw` | `patient_id` | Ordered, event-time patient telemetry |
+| Static context | `patient.context` | `patient_id` | Compacted profile available before replay |
+| Consolidated observed evidence | `patient.evidence` | `patient_id` | P1-P4 evidence, citations, and structured reasoning |
+| Invalid input | `vitals.dlq` | `patient_id` | Rejected JSON, schema, or quality events |
+| Ground truth | `evaluation.ground_truth` | `episode_id` | Held-out labels for measuring detection and alert burden |
+| Knowledge documents | RAG corpus | `document_id` | Versioned, citeable guideline snippets |
 
 | Challenge requirement | Implementation in this repository | Demonstrable evidence |
 | --- | --- | --- |
@@ -255,9 +268,59 @@ The manifest makes a demonstration reproducible: it records the random seed, pat
 - Protocol summaries and threshold configuration require local clinical governance and validation.
 - Online learning needs carefully curated outcome labels and bias monitoring.
 
-## References
+### P4 status: RAG and reasoning integrated
 
-- M. Reyna et al., *Early Prediction of Sepsis from Clinical Data: The PhysioNet/Computing in Cardiology Challenge 2019*, 2020.
-- CDC/NCHS, *National Health and Nutrition Examination Survey*, 2017--2018.
-- M. Singer et al., *The Third International Consensus Definitions for Sepsis and Septic Shock (Sepsis-3)*, 2016.
-- Royal College of Physicians, *National Early Warning Score (NEWS2)*, 2017.
+The P4 service chunks the versioned protocol corpus and supports local TF-IDF or persistent dense-vector retrieval. Its offline deterministic reasoner consumes consolidated P3 evidence and reviewed similar cases, returning a structured explanation, cautious clinician-review action, contributing factors, confidence, and passage-grounded citations. Groq tool-calling is optional and disabled unless explicitly enabled. These prototype outputs are not clinical advice or clinical validation.
+
+## Evaluation that makes the demo credible
+
+Report metrics against `ground_truth_episodes.jsonl`, not only a risk score:
+
+- Episode recall and precision within the labelled escalation window.
+- Median lead time from first alert to labelled escalation window.
+- Alerts per patient-hour and duplicate-alert suppression rate.
+- Artifact false-positive rate.
+- Retrieval citation coverage and audit-record completeness.
+- The generated `data_quality_report.json` records KS distance and lag-1 ACF per channel, real-vs-synthetic correlation error, fitted-versus-realised residual-correlation error, and paired TSTR/TRTR AUROC using patient-level splits. It reports both a deterministic logistic-loss gradient-boosted-stump baseline and stronger depth-3 boosted trees over the five streamed vitals.
+
+Use a patient-level split (not a random row split) so the same profile never appears in both train and evaluation cohorts.
+
+## Project structure
+
+```
+src/clinical_data_gen/
+  generator.py       # causal trajectory, artifact, labels and validation logic
+  fit_physionet.py   # fit PhysioNet parameters and real sepsis templates
+  fit_nhanes.py      # fit independent CDC NHANES HR/BP community baselines
+  schema.py          # explicit event envelopes and schema version
+  pipeline.py        # stateful P1-P4 workflow
+  cli.py             # generate, validate, replay commands
+src/clinical_reasoning/
+  adapters.py        # P3-to-P4 evidence and experience-memory adapters
+  knowledge_store.py # corpus chunking and local retrieval
+  reasoning_agent.py # deterministic and optional Groq reasoning
+  pipeline.py        # P4 service boundary
+src/ingestion/
+  producer.py        # context-first event-time Kafka replay
+  consumer.py        # validation, P1-P3 execution, evidence handoff, DLQ
+clinician_app/       # local P5 mock-cohort review, policy and audit demo
+knowledge/            # versioned RAG corpus seed
+config/               # reproducible scenario mix and cadence
+tests/                # deterministic and safety/invariant tests
+```
+
+## Demo sequence
+
+1. Generate a fixed-seed cohort and show `data_quality_report.json`.
+2. Publish contexts, then replay observations into `vitals.raw`.
+3. Show an artifact that should be suppressed, then a labelled multi-parameter episode.
+4. Inspect the P4 explanation, clinician-review action, and protocol citations; distinguish deterministic local reasoning from optional Groq output.
+5. Use the local P5 review UI to inspect the generated cohort, record clinician actions, and compare policy decisions with the held-out episode window.
+
+## Governance
+
+Do not use real patient identifiers. Generated IDs are synthetic. Preserve the manifest, source/config revision, and knowledge-corpus version with every experiment. A clinician should review all scenario assumptions before any use beyond software demonstration.
+
+## Person 4 integration
+
+Person 4's RAG and clinical reasoning setup is documented in [P4_README.md](P4_README.md). TF-IDF and deterministic reasoning run locally by default; dense local embeddings and the persistent vector index are optional. Groq reasoning requires explicit opt-in and sends evidence to Groq Cloud.
