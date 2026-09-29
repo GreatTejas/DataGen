@@ -1,5 +1,5 @@
 # Python cache and build artifacts
-__pycache__/
+**/__pycache__/
 *.py[cod]
 *.so
 *.egg-info/
@@ -38,3 +38,5 @@ Thumbs.db
 
 # Evaluation outputs
 data/evaluation/
+# Local P4 embedding index (rebuildable from the checked-in corpus)
+data/derived/p4_vector_index.sqlite3*

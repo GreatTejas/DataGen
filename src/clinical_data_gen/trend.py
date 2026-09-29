@@ -1,3 +1,4 @@
+"""Compatibility contract for P3 modules importing clinical_data_gen.trend."""
 """Shared trend result contract for P1 and downstream components."""
 from __future__ import annotations
 
