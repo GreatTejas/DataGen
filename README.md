@@ -36,15 +36,15 @@ flowchart LR
     G --> EVAL[Offline evaluator]
     KAFKA --> INGEST[Validated Kafka consumer]
     KAFKA2 --> INGEST
-    INGEST --> P1[P1 Trend]
-    P1 --> P2[P2 State + Anomaly + Learning]
-    P2 --> P3[P3 Risk + Evidence Fusion + Experience]
-    P3 --> HANDOFF[patient.evidence]
-    HANDOFF --> P4[P4 local RAG + Clinical Reasoning]
-    P4 --> P5[P5 Alert Policy + Review UI]
-    P5 --> AUDIT[Audit + clinician feedback]
-    AUDIT -. feedback .-> P2
-    FILES[Generated mock cohort] -. local demo input .-> P5
+    INGEST --> TREND[Trend Analysis]
+    TREND --> STATE[Patient State + Anomaly Learning]
+    STATE --> FUSION[Risk Assessment + Evidence Fusion + Experience Memory]
+    FUSION --> HANDOFF[patient.evidence]
+    HANDOFF --> REASON[Clinical Knowledge Retrieval + Reasoning]
+    REASON --> POLICY[Alert Policy + Clinician Review]
+    POLICY --> AUDIT[Audit + clinician feedback]
+    AUDIT -. feedback .-> STATE
+    FILES[Generated mock cohort] -. local demo input .-> POLICY
 ```
 
 Live agents receive observed events and static context only. Scenario names, latent state, and episode labels remain evaluation-only artifacts.
@@ -55,7 +55,7 @@ Live agents receive observed events and static context only. Scenario names, lat
 | --- | --- | --- | --- |
 | Vital readings | `vitals.raw` | `patient_id` | Ordered, event-time patient telemetry |
 | Static context | `patient.context` | `patient_id` | Compacted profile available before replay |
-| Consolidated observed evidence | `patient.evidence` | `patient_id` | P1-P4 evidence, citations, and structured reasoning |
+| Consolidated observed evidence | `patient.evidence` | `patient_id` | Trend, state, risk, fused evidence, reasoning, and citations |
 | Invalid input | `vitals.dlq` | `patient_id` | Rejected JSON, schema, or quality events |
 | Ground truth | `evaluation.ground_truth` | `episode_id` | Held-out labels for measuring detection and alert burden |
 | Knowledge documents | RAG corpus | `document_id` | Versioned, citeable guideline snippets |
@@ -96,7 +96,9 @@ The state manager is the common source of truth for all agents. It maintains lat
 
 ### 3. Evidence, clinical knowledge and explanation
 
-Evidence Fusion combines trend, anomaly, risk and similar-case signals into a single evidence packet. The clinical reasoning service constructs a targeted query from the packet and retrieves top protocol passages from the versioned corpus. Each citation preserves the source URL, document identifier, version, locator, retrieval score and passage. This makes the reasoning path reviewable by the clinician and by an evaluator.
+Evidence Fusion combines trend, anomaly, risk and similar-case signals into a single evidence packet. `DeteriorationWorkflow` adapts this fused output through `evidence_from_p3()` and invokes the `P4Service.reason()` clinical-reasoning interface for every event. The default clinical-reasoning path uses local TF-IDF retrieval and deterministic structured reasoning; it retrieves the most relevant versioned protocol passages and returns contributing factors, cautious clinician-review action, confidence, retrieved evidence, and citations. Dense local embeddings and Groq tool-calling use the same evidence contract and can be enabled through environment configuration.
+
+Each citation preserves the source URL, document identifier, version, locator, retrieval score and passage. This makes the reasoning path reviewable by the clinician and by an evaluator.
 
 ### 4. Escalation and feedback
 
@@ -110,20 +112,20 @@ The policy treats a single abnormal signal as a reason to observe, not necessari
 | `src/clinical_data_gen/schema.py` | `EventEnvelope` | Defines the stable file/Kafka transport envelope |
 | `src/clinical_data_gen/state/` | `PatientStateManager.update()` | Maintains context, current state, baseline and history |
 | `src/clinical_data_gen/anomaly/` | `AnomalyAgent.predict()` / `.update()` | Produces anomaly evidence and handles labelled incremental learning |
-| `src/clinical_data_gen/pipeline.py` | `DeteriorationWorkflow.process_event()` | Coordinates the event-time P1--P5 workflow |
+| `src/clinical_data_gen/pipeline.py` | `DeteriorationWorkflow.process_event()` | Coordinates the end-to-end event-time workflow |
 | `src/risk.py`, `src/fusion.py`, `src/experience.py` | `RiskAssessor`, `EvidenceFusion`, `ExperienceMemory` | Scores severity, fuses evidence and retrieves similar reviewed cases |
 | `src/clinical_reasoning/` | `P4Service.reason()` | Retrieves versioned knowledge and creates structured cited reasoning |
 | `clinician_app/policy.py` | `evaluate_stream()` | Applies persistence, quality, priority and cooldown rules |
 | `clinician_app/evaluation.py` | `calculate_metrics()` | Scores policy decisions against held-out episodes |
 
-`DeteriorationWorkflow` processes every observation in a strict sequence: validate live-safe event → update patient state/baseline → trend analysis → anomaly prediction → risk assessment → similar-case retrieval → evidence fusion → knowledge-grounded reasoning → policy decision → audit record. This sequence is the central P1--P5 integration contract of the project.
+`DeteriorationWorkflow` processes every observation in a strict sequence: validate live-safe event → update patient state/baseline → trend analysis → anomaly prediction → risk assessment → similar-case retrieval → evidence fusion → knowledge-grounded reasoning → policy decision → audit record. This sequence is the central end-to-end integration contract of the project.
 
 ## Repository layout
 
 ```text
 src/clinical_data_gen/    generator, schema, fitting, evaluation and workflow
 src/ingestion/            Kafka producer and consumer
-src/clinical_reasoning/   RAG retrieval, reasoning and P3 adapters
+src/clinical_reasoning/   RAG retrieval, reasoning and evidence adapters
 trend_agent/              multi-vital trend analysis
 clinician_app/            dashboard, alert policy, audit and evaluation
 knowledge/                versioned clinical protocol corpus
@@ -141,27 +143,53 @@ Outputs include static context, observed event-time vitals, held-out episode win
 
 ## Quick start
 
-Requires Python 3.10+. From the repository root:
+Requires Python 3.10+. The default demonstration uses local TF-IDF retrieval and deterministic clinical reasoning, so it needs no API key and no embedding-model download. From the repository root:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install -e ".[p4]"
+python -m pip install -e .
 ```
 
-Generate and validate a deterministic cohort:
+The checked-in generated cohort is ready to use. Run the dashboard with the default local reasoning path:
+
+```powershell
+$env:P4_RETRIEVAL_BACKEND = "tfidf"
+$env:P4_LIVE_LLM = "false"
+python clinician_app\server.py
+```
+
+Open `http://127.0.0.1:8765`. If needed, set `CLINICIAN_APP_PORT` before starting the server.
+
+### Rebuild the cohort
+
+Generate and validate a deterministic cohort when a fresh run is required:
 
 ```powershell
 python -m clinical_data_gen.cli generate --output data/generated --patients 60 --minutes 180 --seed 20260918 --params data/derived/physionet_2019_params.json --reference data/training_setA --fidelity-max-files 1000
 python -m clinical_data_gen.cli validate --input data/generated
 ```
 
-Build the local knowledge index, run the reasoning demo, and test the project:
+### Retrieval and reasoning options
+
+| Mode | Dependencies and configuration | Use case |
+| --- | --- | --- |
+| Default local | `P4_RETRIEVAL_BACKEND=tfidf`, `P4_LIVE_LLM=false` | Dependency-light, deterministic dashboard and Kafka demo |
+| Dense local | `python -m pip install -e ".[p4-local]"`, `P4_RETRIEVAL_BACKEND=dense` | Local sentence-transformer embeddings and persistent SQLite vector index |
+| Groq tool calling | `python -m pip install -e ".[p4-groq]"`, `P4_LIVE_LLM=true`, `GROQ_API_KEY` in the process environment | Tool-using reasoning over supplied consolidated evidence |
+
+For dense local retrieval, build the persistent index and run the standalone reasoning demo:
 
 ```powershell
+python -m pip install -e ".[p4-local]"
 python scripts/build_p4_index.py
 python scripts/run_p4_demo.py --retrieval dense
+```
+
+Run the automated tests:
+
+```powershell
 python -m pytest -q
 ```
 
@@ -171,6 +199,8 @@ python -m pytest -q
 
    ```powershell
    $env:KAFKA_BROKER = "localhost:9092"
+   $env:P4_RETRIEVAL_BACKEND = "tfidf"
+   $env:P4_LIVE_LLM = "false"
    python -m ingestion.consumer
    ```
 
@@ -187,7 +217,7 @@ python -m pytest -q
    ```
 
 4. Show a noisy/transient case being suppressed, then a sustained multi-parameter episode with fused evidence, protocol citations, recommendation, clinician action, and audit record.
-
+\
 5. Produce the saved policy report:
 
    ```powershell
@@ -195,6 +225,8 @@ python -m pytest -q
    ```
 
 For terminal-only replay, run `python -m clinical_data_gen.cli replay --input data/generated --speed 60`.
+
+The dashboard reads the generated cohort locally; Kafka replay independently publishes the same analysed and reasoned evidence to `patient.evidence`. Both paths use the same `DeteriorationWorkflow`, clinical-reasoning service boundary, alert policy, and audit contract.
 
 ## Decision controls
 
