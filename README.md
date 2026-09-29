@@ -1,170 +1,263 @@
-# Clinical Deterioration Copilot - Data Generation
+# Agentic Clinical Deterioration & Escalation Copilot
 
-This component creates a reproducible, event-time dataset for the Agentic Clinical Deterioration & Escalation Copilot. It is designed for demonstration and model/system evaluation - **not clinical care, validation, or deployment**.
+**Team 38 | Intra IIT Tech Meet 1.0 | Agentic AI Systems (Healthcare)**
 
-The generator produces much more than random vital signs:
+An event-time clinical decision-support prototype that turns a stream of patient vital signs into an auditable, evidence-grounded escalation workflow. It maintains a patient-specific state, detects sustained multi-parameter change, fuses independent evidence, retrieves relevant protocol knowledge, and presents a prioritised recommendation for clinician review.
 
-- Age/sex-stratified baselines fitted from the local PhysioNet Challenge 2019 training set.
-- Real, baseline-normalised sepsis-onset windows time-warped into synthetic sepsis-like trajectories.
-- Discriminating cases: beta-blocked sepsis, opioid respiratory depression, masked hypoxemia, and COPD low-baseline SpO2.
-- Hard negatives: monitoring artifacts, post-physiotherapy, anxiety, and ambulation.
-- Benign noisy/transient episodes, so downstream logic must suppress false alarms instead of reacting to one threshold crossing.
-- Per-reading trajectory labels and episode-level ground truth, including the first clinically meaningful escalation window.
-- Static patient context and a versioned clinical-knowledge corpus ready for a RAG service.
-- A stable event envelope suitable for Kafka, file replay, or API ingestion.
+> This repository is a research and demonstration prototype built with synthetic patient identities and synthetic streaming data. It is not a diagnostic device and is not intended for clinical deployment.
+
+## Highlights
+
+- Event-time ingestion of HR, SpO2, respiratory rate, and blood pressure.
+- Per-patient state, temporal history, static context, and personalised baselines.
+- Trend, adaptive anomaly, and risk agents with evidence fusion.
+- Online logistic-regression updates from explicit clinician labels and similar-case retrieval from experience memory.
+- Local RAG over versioned clinical protocol summaries with citeable structured reasoning.
+- Alert persistence, signal-quality checks, episode deduplication, and a 30-minute cooldown.
+- A clinician dashboard supporting **Accept**, **Dismiss**, **Defer**, and **Investigate**, plus end-to-end audit records.
+- Reproducible synthetic data generation, leakage-safe labels, and evaluation reports.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    D[PhysioNet 2019 PSV files] --> F[Parameter & template fitting]
-    C[Seeded config] --> P[Patient profile factory]
-    F --> P
-    P --> B[Personalised baseline]
-    B --> T[Trajectory engine]
-    T --> N[Noise & artifact injector]
-    N --> V[VitalEvent JSONL]
-    T --> L[Label engine]
-    L --> G[Ground-truth episodes]
-    P --> X[Static patient context]
-    V --> KAFKA[(Kafka topic: vitals.raw)]
-    X --> KAFKA2[(Kafka topic: patient.context)]
-    G --> EVAL[Offline evaluator]
-    KAFKA --> INGEST[Validated Kafka consumer]
-    KAFKA2 --> INGEST
-    INGEST --> P1[P1 Trend]
-    P1 --> P2[P2 State + Anomaly + Learning]
-    P2 --> P3[P3 Risk + Evidence Fusion + Experience]
-    P3 --> HANDOFF[patient.evidence]
-    HANDOFF -. P4 consumer pending .-> P4[P4 RAG + Clinical Reasoning pending]
-    P4 -. future integration .-> P5[P5 Alert Policy + Review UI]
-    P5 --> AUDIT[Audit + clinician feedback]
-    AUDIT -. feedback .-> P2
-    FILES[Generated mock cohort] -. local demo input .-> P5
+    A[Event-time vital stream\nHR • SpO2 • RR • BP] --> B[Kafka / file replay\nvalidation]
+    C[Static patient context] --> D[Patient State Manager\nbaseline + history]
+    B --> D
+    D --> E[Trend Agent]
+    D --> F[Adaptive Anomaly Agent]
+    D --> G[Risk Assessor]
+    E --> H[Evidence Fusion]
+    F --> H
+    G --> H
+    I[Experience Memory] --> H
+    H --> J[Clinical Reasoning Agent]
+    K[Versioned protocol corpus\nlocal RAG] --> J
+    J --> L[Alert policy\npersist • deduplicate • cooldown]
+    L --> M[Clinician dashboard]
+    M --> N[Audit trail]
+    M --> O[Clinician feedback]
+    O --> F
+    O --> I
 ```
 
-### Event and topic contract
+Live agents receive observed events and static context only. Scenario names, latent state, and episode labels remain evaluation-only artifacts.
 
-| Stream | Kafka topic | Key | Purpose |
-| --- | --- | --- | --- |
-| Vital readings | `vitals.raw` | `patient_id` | Ordered, event-time patient telemetry |
-| Static context | `patient.context` | `patient_id` | Compacted profile available before replay |
-| Consolidated observed evidence | `patient.evidence` | `patient_id` | P1-P3 output; explicit P4-pending handoff |
-| Invalid input | `vitals.dlq` | `patient_id` | Rejected JSON, schema, or quality events |
-| Ground truth | `evaluation.ground_truth` | `episode_id` | Held-out labels for measuring detection and alert burden |
-| Knowledge documents | RAG corpus | `document_id` | Versioned, citeable guideline snippets |
+## Requirements traceability
 
-All events share `schema_version`, `event_id`, `event_time`, `patient_id`, `source`, and a deterministic `run_id`. The live vital payload contains observed values only. Latent values and labels are deliberately isolated in the evaluation outputs so an agent cannot cheat during demo or testing.
+| Challenge requirement | Implementation in this repository | Demonstrable evidence |
+| --- | --- | --- |
+| Process a vital stream | Kafka-compatible producer/consumer and deterministic file replay preserve event-time order | `src/ingestion/`, `clinical_data_gen.cli replay` |
+| Maintain evolving patient state | `PatientStateManager` stores current vitals, temporal history, static context and individual baseline | `src/clinical_data_gen/state/` |
+| Detect multi-parameter deterioration | Trend Agent evaluates concurrent and sustained change across physiological channels | `trend_agent/` and workflow output |
+| Risk-score and prioritise | Risk Assessor and Evidence Fusion produce a risk level and evidence summary | `risk.py`, `fusion.py` |
+| Suppress alarm fatigue | The policy requires persistence/corroboration and applies quality gates, deduplication and cooldown | `clinician_app/policy.py` |
+| Ground explanations | RAG retrieves versioned protocol passages and returns structured citations | `src/clinical_reasoning/` |
+| Keep clinician in the loop | Dashboard records Accept, Dismiss, Defer and Investigate actions with reasons | `clinician_app/` |
+| Maintain an audit trail | Audit JSONL stores observation, evidence, citations, policy, model metadata and clinician decision | `data/evaluation/clinician_audit.jsonl` |
+| Evaluate accuracy | Held-out episode labels support episode-level recall, precision, lead time and false-alert metrics | `scripts/evaluate_alert_policy.py` |
 
-## Dataset construction pipeline
+## Component design
 
-1. Fit age/sex baselines, serial-dependence diagnostics, residual correlation, and real sepsis-onset templates from PhysioNet Challenge 2019 PSV files. Separately fit community HR/BP baselines from CDC NHANES 2017-2018 for hard-negative baseline comparison.
-2. Load the versioned fitted parameter artifact, generator configuration, and fixed seed. The generator consumes fitted baselines, real sepsis templates, and OU/correlation estimates through its correlated AR(1) residual-noise process.
-3. Sample a static patient profile and derive its baseline from the age/sex stratum.
-4. Time-warp a real baseline-normalised window for sepsis-like trajectories; use clearly labelled mechanism-based stress tests for the other archetypes.
-5. Add measurement variability and short-lived artifacts. Artifacts can cross a threshold but do not become an episode label.
-6. Validate physiology and temporal invariants, write event-time JSONL, then emit separate labels and quality metrics.
-7. Replay vital events with their original inter-event timing to Kafka or a local consumer. Publish context first, keyed by patient ID.
+### 1. Ingestion and event contract
 
-This makes the construction pipeline auditable in a midterm report: each signal has a declared source, every synthetic label has a causal scenario, and the seed recreates the exact cohort.
+Vital events are keyed by `patient_id` and use a stable envelope containing `schema_version`, `event_id`, `event_time`, `patient_id`, `run_id`, `source`, and `payload`. The payload holds observed values and a signal-quality indicator. Static context is a separate, compacted stream so that a patient's baseline and relevant history are available before live readings arrive.
+
+The consumer validates the envelope, schema, numeric values, and chronology. Invalid input is isolated in `vitals.dlq`, rather than silently contaminating downstream state. Kafka topic contracts are:
+
+| Topic / artifact | Key | Role |
+| --- | --- | --- |
+| `patient.context` | `patient_id` | Static context supplied before observations |
+| `vitals.raw` | `patient_id` | Ordered, live-safe vital observations |
+| `patient.evidence` | `patient_id` | Consolidated state, analysis and reasoning output |
+| `vitals.dlq` | `patient_id` | Rejected malformed or poor-quality events |
+| `evaluation.ground_truth` | `episode_id` | Offline-only labels for scoring |
+
+### 2. Stateful analysis
+
+The state manager is the common source of truth for all agents. It maintains latest values, missingness markers, a rolling history, static context and a warm-up baseline. The trend agent identifies persistent direction of change; the anomaly agent produces a state-based probability with contributing features; and the risk assessor estimates urgency. A `DeteriorationWorkflow` coordinates these agents in event-time order and makes their contracts explicit.
+
+### 3. Evidence, clinical knowledge and explanation
+
+Evidence Fusion combines trend, anomaly, risk and similar-case signals into a single evidence packet. The clinical reasoning service constructs a targeted query from the packet and retrieves top protocol passages from the versioned corpus. Each citation preserves the source URL, document identifier, version, locator, retrieval score and passage. This makes the reasoning path reviewable by the clinician and by an evaluator.
+
+### 4. Escalation and feedback
+
+The policy treats a single abnormal signal as a reason to observe, not necessarily to alert. It escalates only persistent baseline-relative change, corroborated cross-system evidence, or a high-risk trend/risk combination. Suspect-quality readings are suppressed; repeated alerts for the same episode are held during the cooldown. A clinician action is saved with the full decision context. Explicit anomaly labels can update the online learner, while all actions enrich the experience memory.
+
+### Code reference
+
+| Repository artifact | Main public interface | Documentation role |
+| --- | --- | --- |
+| `src/clinical_data_gen/generator.py` | `ClinicalDataGenerator.create()` | Builds seeded profiles, trajectories, artifacts, event streams and labels |
+| `src/clinical_data_gen/schema.py` | `EventEnvelope` | Defines the stable file/Kafka transport envelope |
+| `src/clinical_data_gen/state/` | `PatientStateManager.update()` | Maintains context, current state, baseline and history |
+| `src/clinical_data_gen/anomaly/` | `AnomalyAgent.predict()` / `.update()` | Produces anomaly evidence and handles labelled incremental learning |
+| `src/clinical_data_gen/pipeline.py` | `DeteriorationWorkflow.process_event()` | Coordinates the event-time P1--P4 workflow |
+| `src/risk.py`, `src/fusion.py`, `src/experience.py` | `RiskAssessor`, `EvidenceFusion`, `ExperienceMemory` | Scores severity, fuses evidence and retrieves similar reviewed cases |
+| `src/clinical_reasoning/` | `P4Service.reason()` | Retrieves versioned knowledge and creates structured cited reasoning |
+| `clinician_app/policy.py` | `evaluate_stream()` | Applies persistence, quality, priority and cooldown rules |
+| `clinician_app/evaluation.py` | `calculate_metrics()` | Scores policy decisions against held-out episodes |
+
+`DeteriorationWorkflow` processes every observation in a strict sequence: validate live-safe event → update patient state/baseline → trend analysis → anomaly prediction → risk assessment → similar-case retrieval → evidence fusion → knowledge-grounded reasoning → policy decision → audit record. This sequence is the central P1--P5 integration contract of the project.
+
+## Repository layout
+
+```text
+src/clinical_data_gen/    generator, schema, fitting, evaluation and workflow
+src/ingestion/            Kafka producer and consumer
+src/clinical_reasoning/   RAG retrieval, reasoning and P3 adapters
+trend_agent/              multi-vital trend analysis
+clinician_app/            dashboard, alert policy, audit and evaluation
+knowledge/                versioned clinical protocol corpus
+config/                   reproducible generator and reasoning configuration
+scripts/                  demo and evaluation utilities
+tests/                    unit, safety and workflow tests
+docs/final_report.tex     final technical report source
+```
+
+## Data and scenarios
+
+The generator fits age/sex-stratified baselines, serial dependence, residual correlation, and sepsis-onset templates from local PhysioNet Challenge 2019 data. CDC NHANES 2017--2018 HR/BP baselines provide an independent hard-negative reference. A seeded cohort includes stable and transient trajectories; monitoring artifacts; post-physiotherapy, anxiety, and ambulation cases; and sepsis-like decline, beta-blocked sepsis, opioid respiratory depression, masked hypoxemia, and haemodynamic shock.
+
+Outputs include static context, observed event-time vitals, held-out episode windows and labels, a knowledge corpus, data-quality diagnostics, and a manifest containing run parameters and hashes.
 
 ## Quick start
 
-Requires Python 3.10+. Install the project and its runtime dependencies from the repository root:
+Requires Python 3.10+. From the repository root:
 
 ```powershell
-python -m pip install -e .
-python -m clinical_data_gen.cli fit-physionet --input data/training_setA --output data/derived/physionet_2019_params.json
-python -m clinical_data_gen.cli fit-nhanes-baselines --bp data/secondary/NHANES_2017_2018_BPX_J.XPT --demographics data/secondary/NHANES_2017_2018_DEMO_J.XPT
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -e ".[p4]"
+```
+
+Generate and validate a deterministic cohort:
+
+```powershell
 python -m clinical_data_gen.cli generate --output data/generated --patients 60 --minutes 180 --seed 20260918 --params data/derived/physionet_2019_params.json --reference data/training_setA --fidelity-max-files 1000
 python -m clinical_data_gen.cli validate --input data/generated
 ```
 
-The Kafka consumer validates context and vitals, runs the shared P1-P3 workflow, and publishes consolidated observed evidence to `patient.evidence`. Start it in one terminal, then replay the generated cohort in another:
+Build the local knowledge index, run the reasoning demo, and test the project:
 
 ```powershell
-$env:KAFKA_BROKER = "localhost:9092"
-python -m ingestion.consumer
+python scripts/build_p4_index.py
+python scripts/run_p4_demo.py --retrieval dense
+python -m pytest -q
 ```
 
-```powershell
-python -m ingestion.producer --input data/generated/vitals_observed.jsonl --speed 60
-```
+## Demonstration
 
-The producer publishes `patient.context` before time-ordered `vitals.raw` readings; `--speed 60` sends one minute of simulated time per real second. The CLI file replay remains available for stdout-only inspection: `python -m clinical_data_gen.cli replay --input data/generated --speed 60`. The P5 dashboard reads the generated mock cohort locally; it does not yet consume Kafka output. P4 RAG retrieval and clinical reasoning are placeholders in both handoffs.
+1. Start the consumer:
 
-## Outputs
+   ```powershell
+   $env:KAFKA_BROKER = "localhost:9092"
+   python -m ingestion.consumer
+   ```
 
-```
+2. Replay the cohort in a second terminal. Context is sent before event-time vitals; `--speed 60` maps one simulated minute to one second.
+
+   ```powershell
+   python -m ingestion.producer --input data/generated/vitals_observed.jsonl --speed 60
+   ```
+
+3. Launch the clinician interface and open `http://127.0.0.1:8765`.
+
+   ```powershell
+   python clinician_app/server.py
+   ```
+
+4. Show a noisy/transient case being suppressed, then a sustained multi-parameter episode with fused evidence, protocol citations, recommendation, clinician action, and audit record.
+
+5. Produce the saved policy report:
+
+   ```powershell
+   python scripts/evaluate_alert_policy.py
+   ```
+
+For terminal-only replay, run `python -m clinical_data_gen.cli replay --input data/generated --speed 60`.
+
+## Decision controls
+
+| Stage | Responsibility | Guardrail |
+| --- | --- | --- |
+| Ingestion | Validate event schema, values and time order | Invalid messages go to a dead-letter topic |
+| State | Maintain context, history and baseline | Context is registered before replay |
+| Analysis | Produce trend, anomaly and risk evidence | An anomaly alone is never an alert |
+| Reasoning | Fuse evidence and retrieve protocol grounding | Citations retain source/version/locator provenance |
+| Alerting | Alert, defer or suppress | Persistence, quality checks, deduplication and cooldown |
+| Review | Record clinician action and reason | Only explicit anomaly labels train the online model |
+
+## Evaluation
+
+The checked-in fixed-seed cohort contains **60 patient contexts**, **10,800 observed vital events**, and **33 labelled deterioration episodes**. The quality report records passed physiology and leakage checks. Patient-level synthetic-to-real transfer diagnostics report a 0.0122 AUROC gap for boosted stumps and a 0.0129 gap for depth-3 boosted trees; these assess data fidelity, not clinical effectiveness.
+
+The alert-policy evaluator reports episode precision/recall, lead time, alerts per patient-hour, duplicate suppression, artifact false-positive rate, citation coverage, and audit completeness. It reads held-out labels only after runtime processing, never as agent inputs.
+
+### Evaluation protocol
+
+Evaluation uses patient-level splits wherever training and testing are compared, so the same patient profile cannot appear in both sets. Runtime receives `vitals_observed.jsonl` and `patient_context.jsonl`; the evaluator later compares alert windows with `ground_truth_episodes.jsonl`. This separation measures whether the workflow catches an episode early enough, rather than merely recognising a label in a static table.
+
+| Measure | Interpretation |
+| --- | --- |
+| Episode recall | Fraction of labelled deterioration episodes with an alert in the onset-to-escalation window |
+| Episode precision | Fraction of alert episodes overlapping a labelled deterioration interval |
+| Median lead time | Time from the first qualifying alert to the labelled escalation window |
+| Alerts per patient-hour | Operational alert burden on the care team |
+| Duplicate suppression | Candidate repeated alerts prevented by episode/cooldown logic |
+| Artifact false-positive rate | Artifact-labelled observations incorrectly escalated |
+| Citation coverage | Fraction of escalations carrying retrievable supporting evidence |
+| Audit completeness | Fraction of reviewed records containing required decision fields |
+
+### Current fixed-seed cohort results
+
+| Result | Value |
+| --- | ---: |
+| Patient contexts / observed events / episodes | 60 / 10,800 / 33 |
+| Detected episodes | 19 |
+| Episode precision / recall | 0.3684 / 0.5758 |
+| Median lead time | 29.0 minutes |
+| Alerts per patient-hour | 0.3687 |
+| Duplicate suppression rate | 0.9143 |
+| Artifact false-positive rate | 0.0 |
+| Audit-record completeness | 1.0 |
+
+These values are deterministic outputs of the checked-in cohort and evaluation artifacts. They should be presented alongside the scenario mix and operating-point policy, rather than as hospital-validation claims.
+
+## Data outputs
+
+```text
 data/generated/
-  manifest.json                 # seed, schema, generation parameters, hashes
-  patient_context.jsonl         # compacted/static context
-  vitals_observed.jsonl         # only fields permitted to the streaming copilot
-  ground_truth_episodes.jsonl   # scenario, onset, escalation window, evidence
-  evaluation_labels.jsonl       # held-out event-level labels and latent values
-  data_quality_report.json      # invariant/coverage metrics
-  knowledge_corpus.jsonl        # RAG-ready protocol snippets
+  manifest.json                 # seed, run ID, parameters and SHA-256 hashes
+  patient_context.jsonl         # static profile stream
+  vitals_observed.jsonl         # live-safe vital-event stream
+  ground_truth_episodes.jsonl   # held-out episode onset/escalation windows
+  evaluation_labels.jsonl       # held-out event-level labels and latent state
+  knowledge_corpus.jsonl        # protocol corpus copied with the run
+  data_quality_report.json      # invariants and fidelity diagnostics
 ```
 
-## Important design decisions
+The manifest makes a demonstration reproducible: it records the random seed, patient count, duration, run identifier and hashes of the configuration, fitted parameters, corpus and emitted JSONL files.
 
-### Leakage prevention
+## Technical choices
 
-The live payload intentionally excludes `scenario`, `risk_label`, `latent`, `trend_phase`, and `episode_id`. These are in the evaluator-only files. Keep them in a separate bucket or topic ACL in the full project.
+- Personal baselines detect meaningful individual change and reduce population-threshold false alarms.
+- Multi-agent fusion prevents any single score from unilaterally escalating a patient.
+- Scenario and label separation enables credible offline evaluation without leakage.
+- Versioned RAG citations make reasoning inspectable.
+- A clinician action is kept distinct from a supervised anomaly label, avoiding incorrect learning from workflow choices.
 
-### Clinical realism without claiming clinical validity
+## Limitations
 
-Baselines, serial-dependence diagnostics, residual correlation, and sepsis-onset templates are fitted from the local PhysioNet Challenge 2019 training data. The generator consumes fitted baselines, real sepsis templates, and fitted correlated AR(1) residual noise. CDC NHANES 2017-2018 adds an independent community HR/BP baseline reference for hard-negative comparison; it is not used as a deterioration-trajectory source. Medication effects are intentionally not fitted or applied: Challenge-2019 has no medication history or administration field. The additional discriminating archetypes are mechanism-based stress tests, not claims of clinical validation.
+- Synthetic-cohort results do not establish hospital-population generalisation or clinical effectiveness.
+- Protocol summaries and threshold configuration require local clinical governance and validation.
+- Online learning needs carefully curated outcome labels and bias monitoring.
 
-### P4 status: RAG grounding pending
+## References
 
-The repository includes a versioned protocol-corpus seed with document IDs, source URLs, versions, and locators. It is not yet chunked, embedded, indexed, or retrieved by a RAG service. The current P4 interface explicitly returns `not_implemented` and empty evidence/citation fields; it must not be described as providing clinical explanations or recommendations.
-
-## Evaluation that makes the demo credible
-
-Report metrics against `ground_truth_episodes.jsonl`, not only a risk score:
-
-- Episode recall and precision within the labelled escalation window.
-- Median lead time from first alert to labelled escalation window.
-- Alerts per patient-hour and duplicate-alert suppression rate.
-- Artifact false-positive rate.
-- Retrieval citation coverage and audit-record completeness.
-- The generated `data_quality_report.json` records KS distance and lag-1 ACF per channel, real-vs-synthetic correlation error, fitted-versus-realised residual-correlation error, and paired TSTR/TRTR AUROC using patient-level splits. It reports both a deterministic logistic-loss gradient-boosted-stump baseline and stronger depth-3 boosted trees over the five streamed vitals.
-
-Use a patient-level split (not a random row split) so the same profile never appears in both train and evaluation cohorts.
-
-## Project structure
-
-```
-src/clinical_data_gen/
-  generator.py       # causal trajectory, artifact, labels and validation logic
-  fit_physionet.py   # fit PhysioNet parameters and real sepsis templates
-  fit_nhanes.py      # fit independent CDC NHANES HR/BP community baselines
-  schema.py          # explicit event envelopes and schema version
-  pipeline.py        # stateful P1-P3 workflow and P4 handoff
-  clinical_reasoning.py # explicit P4 placeholder
-  cli.py             # generate, validate, replay commands
-src/ingestion/
-  producer.py        # context-first event-time Kafka replay
-  consumer.py        # validation, P1-P3 execution, evidence handoff, DLQ
-clinician_app/       # local P5 mock-cohort review, policy and audit demo
-knowledge/            # versioned RAG corpus seed
-config/               # reproducible scenario mix and cadence
-tests/                # deterministic and safety/invariant tests
-```
-
-## Demo sequence
-
-1. Generate a fixed-seed cohort and show `data_quality_report.json`.
-2. Publish contexts, then replay observations into `vitals.raw`.
-3. Show an artifact that should be suppressed, then a labelled multi-parameter episode.
-4. Show the P4-pending handoff (no retrieved evidence, citations, or recommendation) rather than claiming RAG or clinical reasoning is implemented.
-5. Use the local P5 review UI to inspect the generated cohort, record clinician actions, and compare policy decisions with the held-out episode window.
-
-## Governance
-
-Do not use real patient identifiers. Generated IDs are synthetic. Preserve the manifest, source/config revision, and knowledge-corpus version with every experiment. A clinician should review all scenario assumptions before any use beyond software demonstration.
-
-## Person 4 integration
-
-Person 4's local RAG and clinical reasoning setup is documented in [P4_README.md](P4_README.md). Local embeddings and the persistent vector index run on this machine; optional Groq reasoning requires a `GROQ_API_KEY` and sends the evidence to Groq Cloud.
+- M. Reyna et al., *Early Prediction of Sepsis from Clinical Data: The PhysioNet/Computing in Cardiology Challenge 2019*, 2020.
+- CDC/NCHS, *National Health and Nutrition Examination Survey*, 2017--2018.
+- M. Singer et al., *The Third International Consensus Definitions for Sepsis and Septic Shock (Sepsis-3)*, 2016.
+- Royal College of Physicians, *National Early Warning Score (NEWS2)*, 2017.
