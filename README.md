@@ -146,3 +146,7 @@ tests/                # deterministic and safety/invariant tests
 ## Governance
 
 Do not use real patient identifiers. Generated IDs are synthetic. Preserve the manifest, source/config revision, and knowledge-corpus version with every experiment. A clinician should review all scenario assumptions before any use beyond software demonstration.
+
+## Person 4 integration
+
+Person 4's local RAG and clinical reasoning setup is documented in [P4_README.md](P4_README.md). Local embeddings and the persistent vector index run on this machine; optional Groq reasoning requires a `GROQ_API_KEY` and sends the evidence to Groq Cloud.

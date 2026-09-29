@@ -13,6 +13,11 @@ dependencies = [
     "pandas>=2.0",
 ]
 
+[project.optional-dependencies]
+p4-local = ["sentence-transformers>=3.0"]
+p4-groq = ["groq>=0.11"]
+p4 = ["sentence-transformers>=3.0", "groq>=0.11"]
+
 [project.scripts]
 clinical-data-gen = "clinical_data_gen.cli:main"
 
